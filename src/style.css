@@ -892,3 +892,299 @@ body {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+
+/* —— Pack bank —— */
+.pack-bank {
+  margin: 0 0 8px;
+  font-family: var(--display);
+  font-size: 1.15rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.pack-pill {
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.35);
+}
+
+.topbar-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+/* —— Clickable cards —— */
+.clickable-card {
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+button.tcg-card {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.mini-card.clickable-card:hover,
+.mini-card.clickable-card:focus-visible {
+  transform: translateY(-3px);
+  box-shadow: 0 10px 28px rgba(124, 58, 237, 0.3);
+  outline: none;
+}
+
+button.trail-slot {
+  appearance: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.trail-slot.clickable:hover {
+  transform: scale(1.06);
+}
+
+/* —— Catalogue / owned —— */
+.filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 4px;
+}
+
+.filter-bar .chip.active,
+.stat-chip.filter-chip.active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  background: rgba(192, 132, 252, 0.22);
+}
+
+.stat-chip.filter-chip {
+  appearance: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition: transform 0.15s, outline 0.15s;
+}
+
+.stat-chip.filter-chip:hover {
+  transform: translateY(-1px);
+}
+
+.mini-card.owned {
+  border-color: color-mix(in srgb, var(--accent2) 55%, transparent);
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.25);
+}
+
+.mini-card.owned .mini-art::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 60%, rgba(56, 189, 248, 0.18));
+  pointer-events: none;
+}
+
+.owned-badge {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: rgba(56, 189, 248, 0.95);
+  color: #0b0b12;
+  font-size: 0.75rem;
+  font-weight: 800;
+  z-index: 2;
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
+}
+
+.owned-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.owned-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #38bdf8;
+  display: inline-block;
+  box-shadow: 0 0 8px #38bdf8;
+}
+
+/* —— Character detail modal —— */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(4, 4, 12, 0.72);
+  backdrop-filter: blur(6px);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.modal-dialog {
+  position: relative;
+  width: min(640px, 100%);
+  max-height: min(90svh, 900px);
+  overflow-y: auto;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: linear-gradient(165deg, #16162a, #0c0c18);
+  box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+  padding: 20px 18px 22px;
+}
+
+.modal-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-size: 1.5rem;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.modal-close:hover {
+  background: rgba(248, 113, 113, 0.25);
+}
+
+.modal-body {
+  padding-right: 8px;
+}
+
+.modal-loading,
+.modal-error {
+  text-align: center;
+  padding: 36px 12px;
+}
+
+.modal-hero {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 16px;
+  align-items: start;
+  margin-bottom: 18px;
+}
+
+@media (max-width: 520px) {
+  .modal-hero {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    text-align: center;
+  }
+}
+
+.modal-art {
+  width: 140px;
+  aspect-ratio: 3 / 4;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 2px solid var(--border);
+  background: #10101c;
+}
+
+.modal-art.rarity-commun { border-color: #94a3b8; }
+.modal-art.rarity-peu-commun { border-color: #22c55e; }
+.modal-art.rarity-rare { border-color: #3b82f6; }
+.modal-art.rarity-epique { border-color: #a855f7; }
+.modal-art.rarity-legendaire { border-color: #f59e0b; }
+
+.modal-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.modal-meta h2 {
+  margin: 0 0 4px;
+  font-family: var(--display);
+  font-size: 1.25rem;
+  padding-right: 28px;
+}
+
+.modal-kanji {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.inline-badge {
+  position: static;
+  display: inline-flex;
+  margin-bottom: 8px;
+}
+
+.modal-fav {
+  margin: 6px 0;
+  font-weight: 700;
+  color: var(--gold);
+}
+
+.modal-nicks {
+  margin: 6px 0 10px;
+  font-size: 0.92rem;
+}
+
+.mal-link {
+  display: inline-flex;
+  margin-top: 4px;
+  text-decoration: none;
+}
+
+.modal-section {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.modal-section h3 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+}
+
+.modal-about {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--text);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.modal-anime-list {
+  margin: 0;
+  padding: 0 0 0 18px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 0.92rem;
+}
+
+.modal-anime-list li {
+  margin-bottom: 4px;
+}

@@ -1,13 +1,15 @@
 import './style.css';
-import { fetchGlobalCharacterPool, GLOBAL_ANIME_IDS } from './jikan.js';
+import { fetchGlobalCharacterPool, GLOBAL_ANIME_IDS, getCharacterFull } from './jikan.js';
 import { enrichPool, openPack, RARITIES, PACK_SIZE } from './rarity.js';
 
-const COOLDOWN_MS = 5 * 60 * 1000;
+const ACCRUAL_MS = 5 * 60 * 1000;
+const MAX_PACKS = 10;
 const LS_COLLECTION = 'apo-collection';
-const LS_LAST_OPEN = 'apo-lastPackOpenAt';
+const LS_PACK_COUNT = 'apo-packCount';
+const LS_LAST_ACCRUAL = 'apo-lastAccrualAt';
 
 const state = {
-  tab: 'open', // open | collection
+  tab: 'open', // open | collection | catalogue
   view: 'home', // home | loading | reveal
   characterPool: [],
   poolReady: false,
@@ -18,11 +20,15 @@ const state = {
   collection: loadCollection(),
   error: null,
   revealing: false,
-  lastPackOpenAt: loadLastPackOpenAt(),
-  cooldownLeftMs: 0,
+  packCount: 0,
+  lastAccrualAt: 0,
+  nextPackLeftMs: 0,
+  catalogueFilter: 'all', // all | rarity id
+  modal: null, // { status: 'loading'|'ready'|'error', card, detail, error }
 };
 
-let cooldownTimer = null;
+let accrualTimer = null;
+let escapeHandler = null;
 
 const app = document.querySelector('#app');
 
@@ -38,24 +44,65 @@ function saveCollection() {
   localStorage.setItem(LS_COLLECTION, JSON.stringify(state.collection));
 }
 
-function loadLastPackOpenAt() {
-  const raw = localStorage.getItem(LS_LAST_OPEN);
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : 0;
+function loadPackBank() {
+  const rawCount = localStorage.getItem(LS_PACK_COUNT);
+  const rawAccrual = localStorage.getItem(LS_LAST_ACCRUAL);
+
+  if (rawCount == null && rawAccrual == null) {
+    // First visit: 1 pack ready, accrual clock starts now
+    state.packCount = 1;
+    state.lastAccrualAt = Date.now();
+    savePackBank();
+    return;
+  }
+
+  const count = Number(rawCount);
+  const accrual = Number(rawAccrual);
+  state.packCount = Number.isFinite(count) && count >= 0 ? Math.min(MAX_PACKS, Math.floor(count)) : 1;
+  state.lastAccrualAt = Number.isFinite(accrual) && accrual > 0 ? accrual : Date.now();
+  syncPackBank();
 }
 
-function saveLastPackOpenAt(ts) {
-  state.lastPackOpenAt = ts;
-  localStorage.setItem(LS_LAST_OPEN, String(ts));
+function savePackBank() {
+  localStorage.setItem(LS_PACK_COUNT, String(state.packCount));
+  localStorage.setItem(LS_LAST_ACCRUAL, String(state.lastAccrualAt));
 }
 
-function cooldownRemaining() {
-  if (!state.lastPackOpenAt) return 0;
-  return Math.max(0, state.lastPackOpenAt + COOLDOWN_MS - Date.now());
+/**
+ * Accrue packs from elapsed offline/online time up to MAX_PACKS.
+ * Cooldown accrual is independent of opens.
+ */
+function syncPackBank() {
+  const now = Date.now();
+  if (state.packCount >= MAX_PACKS) {
+    state.lastAccrualAt = now;
+    state.nextPackLeftMs = 0;
+    savePackBank();
+    return;
+  }
+
+  const elapsed = Math.max(0, now - state.lastAccrualAt);
+  const gained = Math.floor(elapsed / ACCRUAL_MS);
+  if (gained > 0) {
+    const room = MAX_PACKS - state.packCount;
+    const credited = Math.min(room, gained);
+    state.packCount += credited;
+    state.lastAccrualAt += credited * ACCRUAL_MS;
+    if (state.packCount >= MAX_PACKS) {
+      state.lastAccrualAt = now;
+    }
+    savePackBank();
+  }
+
+  state.nextPackLeftMs =
+    state.packCount >= MAX_PACKS
+      ? 0
+      : Math.max(0, state.lastAccrualAt + ACCRUAL_MS - Date.now());
 }
 
 function canOpenPack() {
-  return cooldownRemaining() === 0;
+  syncPackBank();
+  return state.packCount > 0;
 }
 
 function formatCountdown(ms) {
@@ -65,38 +112,53 @@ function formatCountdown(ms) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-function startCooldownTicker() {
-  stopCooldownTicker();
+function startAccrualTicker() {
+  stopAccrualTicker();
   const tick = () => {
-    state.cooldownLeftMs = cooldownRemaining();
+    const prevCount = state.packCount;
+    syncPackBank();
+
     if (state.tab === 'open' && (state.view === 'home' || state.view === 'loading')) {
       const btn = document.getElementById('open-pack');
+      const bank = document.getElementById('pack-bank-label');
       const cd = document.getElementById('cooldown-label');
-      if (btn || cd) {
-        // Soft update without full re-render when possible
-        if (state.cooldownLeftMs > 0) {
-          if (btn) {
-            btn.disabled = true;
-            btn.textContent = `Disponible dans ${formatCountdown(state.cooldownLeftMs)}`;
-          }
-          if (cd) cd.textContent = `Prochain booster dans ${formatCountdown(state.cooldownLeftMs)}`;
-        } else if (state.view === 'home' && state.poolReady) {
-          // Refresh home so button becomes active
-          render();
-          return;
+
+      if (bank) bank.textContent = `Paquets : ${state.packCount} / ${MAX_PACKS}`;
+
+      if (state.packCount > prevCount && state.view === 'home' && state.poolReady) {
+        render();
+        return;
+      }
+
+      if (state.packCount <= 0) {
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent =
+            state.nextPackLeftMs > 0
+              ? `Prochain paquet dans ${formatCountdown(state.nextPackLeftMs)}`
+              : 'Aucun paquet';
         }
+        if (cd) {
+          cd.textContent =
+            state.nextPackLeftMs > 0
+              ? `Prochain paquet dans ${formatCountdown(state.nextPackLeftMs)}`
+              : '';
+        }
+      } else if (state.packCount < MAX_PACKS && cd) {
+        cd.textContent = `Prochain paquet dans ${formatCountdown(state.nextPackLeftMs)}`;
+      } else if (state.packCount >= MAX_PACKS && cd) {
+        cd.textContent = 'Banque pleine (10 / 10)';
       }
     }
-    if (state.cooldownLeftMs <= 0) stopCooldownTicker();
   };
   tick();
-  cooldownTimer = setInterval(tick, 1000);
+  accrualTimer = setInterval(tick, 1000);
 }
 
-function stopCooldownTicker() {
-  if (cooldownTimer) {
-    clearInterval(cooldownTimer);
-    cooldownTimer = null;
+function stopAccrualTicker() {
+  if (accrualTimer) {
+    clearInterval(accrualTimer);
+    accrualTimer = null;
   }
 }
 
@@ -121,6 +183,10 @@ function addToCollection(cards) {
   saveCollection();
 }
 
+function ownedIds() {
+  return new Set(state.collection.map((c) => c.id));
+}
+
 function poolTotalsByRarity() {
   const totals = Object.fromEntries(RARITIES.map((r) => [r.id, 0]));
   for (const c of state.characterPool) {
@@ -138,10 +204,10 @@ function ownedUniqueByRarity() {
 }
 
 async function init() {
+  loadPackBank();
   state.view = 'loading';
-  state.cooldownLeftMs = cooldownRemaining();
   render();
-  if (state.cooldownLeftMs > 0) startCooldownTicker();
+  startAccrualTicker();
 
   try {
     const raw = await fetchGlobalCharacterPool(GLOBAL_ANIME_IDS);
@@ -172,9 +238,12 @@ function startPackOpen() {
     return;
   }
 
-  saveLastPackOpenAt(Date.now());
-  state.cooldownLeftMs = COOLDOWN_MS;
-  startCooldownTicker();
+  syncPackBank();
+  if (state.packCount <= 0) return;
+  state.packCount -= 1;
+  savePackBank();
+  syncPackBank();
+  startAccrualTicker();
 
   state.currentPack = openPack(state.characterPool, PACK_SIZE);
   state.revealIndex = -1;
@@ -237,6 +306,44 @@ function setTab(tab) {
   render();
 }
 
+function findCardById(id) {
+  const nid = Number(id);
+  return (
+    state.collection.find((c) => c.id === nid) ||
+    state.characterPool.find((c) => c.id === nid) ||
+    state.currentPack.find((c) => c.id === nid) ||
+    null
+  );
+}
+
+async function openCharacterModal(cardOrId) {
+  const card = typeof cardOrId === 'object' ? cardOrId : findCardById(cardOrId);
+  if (!card?.id) return;
+
+  state.modal = { status: 'loading', card, detail: null, error: null };
+  render();
+
+  try {
+    const detail = await getCharacterFull(card.id);
+    if (!state.modal || state.modal.card?.id !== card.id) return;
+    state.modal = { status: 'ready', card, detail, error: null };
+  } catch (e) {
+    if (!state.modal || state.modal.card?.id !== card.id) return;
+    state.modal = {
+      status: 'error',
+      card,
+      detail: null,
+      error: 'Impossible de charger les infos du personnage.',
+    };
+  }
+  render();
+}
+
+function closeModal() {
+  state.modal = null;
+  render();
+}
+
 function render() {
   app.innerHTML = `
     <div class="bg-orbs" aria-hidden="true"></div>
@@ -250,21 +357,30 @@ function render() {
       </div>
       <div class="topbar-meta">
         <span class="pill">${state.collection.length} cartes</span>
+        <span class="pill pack-pill">Paquets ${state.packCount}/${MAX_PACKS}</span>
       </div>
     </header>
 
     <nav class="tabs" role="tablist" aria-label="Navigation">
       <button type="button" class="tab ${state.tab === 'open' ? 'active' : ''}" data-tab="open" role="tab" aria-selected="${state.tab === 'open'}">Ouvrir</button>
       <button type="button" class="tab ${state.tab === 'collection' ? 'active' : ''}" data-tab="collection" role="tab" aria-selected="${state.tab === 'collection'}">Collection</button>
+      <button type="button" class="tab ${state.tab === 'catalogue' ? 'active' : ''}" data-tab="catalogue" role="tab" aria-selected="${state.tab === 'catalogue'}">Catalogue</button>
     </nav>
 
     <main class="main">
       ${state.error ? `<div class="banner error" role="alert">${esc(state.error)}</div>` : ''}
-      ${state.tab === 'collection' ? collectionHtml() : openTabHtml()}
+      ${
+        state.tab === 'collection'
+          ? collectionHtml()
+          : state.tab === 'catalogue'
+            ? catalogueHtml()
+            : openTabHtml()
+      }
     </main>
     <footer class="footer">
       Données via <a href="https://jikan.moe" target="_blank" rel="noopener">Jikan API</a> · images MyAnimeList
     </footer>
+    ${state.modal ? modalHtml() : ''}
   `;
   bindEvents();
 }
@@ -281,9 +397,19 @@ function openTabHtml() {
 }
 
 function homeHtml() {
-  const left = cooldownRemaining();
-  const ready = state.poolReady && left === 0;
+  syncPackBank();
+  const ready = state.poolReady && state.packCount > 0;
   const poolCount = state.characterPool.length;
+  const underCap = state.packCount < MAX_PACKS;
+
+  let btnLabel = 'Ouvrir un booster';
+  if (!state.poolReady) btnLabel = 'Chargement…';
+  else if (state.packCount <= 0) {
+    btnLabel =
+      state.nextPackLeftMs > 0
+        ? `Prochain paquet dans ${formatCountdown(state.nextPackLeftMs)}`
+        : 'Aucun paquet';
+  }
 
   return `
     <section class="panel home-panel center-panel">
@@ -292,6 +418,8 @@ function homeHtml() {
         Un pool unique tiré de ${GLOBAL_ANIME_IDS.length} animes populaires
         ${poolCount ? ` · <strong>${poolCount}</strong> personnages` : ''}.
       </p>
+
+      <p class="pack-bank" id="pack-bank-label">Paquets : ${state.packCount} / ${MAX_PACKS}</p>
 
       <button type="button" class="pack-closed ${ready ? '' : 'disabled'}" id="open-pack-visual" ${ready ? '' : 'disabled'} aria-label="Ouvrir le booster">
         <div class="pack-art">
@@ -304,19 +432,14 @@ function homeHtml() {
 
       <div class="home-actions">
         <button type="button" class="btn primary" id="open-pack" ${ready ? '' : 'disabled'}>
-          ${
-            !state.poolReady
-              ? 'Chargement…'
-              : left > 0
-                ? `Disponible dans ${formatCountdown(left)}`
-                : 'Ouvrir un booster'
-          }
+          ${btnLabel}
         </button>
         ${
-          left > 0
-            ? `<p class="cooldown-label" id="cooldown-label">Prochain booster dans ${formatCountdown(left)}</p>`
-            : `<p class="hint">1 booster toutes les 5 minutes</p>`
+          underCap
+            ? `<p class="cooldown-label" id="cooldown-label">Prochain paquet dans ${formatCountdown(state.nextPackLeftMs)}</p>`
+            : `<p class="cooldown-label" id="cooldown-label">Banque pleine (10 / 10)</p>`
         }
+        <p class="hint">+1 paquet toutes les 5 minutes · max ${MAX_PACKS}</p>
       </div>
     </section>
   `;
@@ -369,9 +492,9 @@ function revealHtml() {
         ${pack
           .map((c, i) => {
             if (i > idx) return `<div class="trail-slot locked">?</div>`;
-            return `<div class="trail-slot rarity-${c.rarity}" title="${escAttr(c.name)}">
+            return `<button type="button" class="trail-slot rarity-${c.rarity} clickable" data-char-id="${c.id}" title="${escAttr(c.name)}">
               <img src="${escAttr(c.image)}" alt="" />
-            </div>`;
+            </button>`;
           })
           .join('')}
       </div>
@@ -399,7 +522,7 @@ function cardFaceHtml(card, animate) {
   const flipClass = animate ? 'flip-in' : '';
   const glow = `glow-${card.rarity}`;
   return `
-    <div class="tcg-card ${flipClass} ${glow} rarity-${card.rarity}" data-rarity="${card.rarity}">
+    <button type="button" class="tcg-card clickable-card ${flipClass} ${glow} rarity-${card.rarity}" data-rarity="${card.rarity}" data-char-id="${card.id}" aria-label="Voir ${escAttr(card.name)}">
       <div class="tcg-inner">
         <div class="tcg-frame">
           <span class="rarity-badge" style="--rc:${card.rarityColor}">${esc(card.rarityLabel)}</span>
@@ -412,7 +535,7 @@ function cardFaceHtml(card, animate) {
           </div>
         </div>
       </div>
-    </div>
+    </button>
   `;
 }
 
@@ -469,13 +592,75 @@ function collectionHtml() {
   `;
 }
 
-function miniCardHtml(card, showCount = false) {
+function catalogueHtml() {
+  const totals = poolTotalsByRarity();
+  const owned = ownedIds();
+  const filter = state.catalogueFilter;
+  const cards =
+    filter === 'all'
+      ? state.characterPool
+      : state.characterPool.filter((c) => c.rarity === filter);
+
+  const sorted = [...cards].sort((a, b) => {
+    const order = RARITIES.map((r) => r.id).reverse();
+    return order.indexOf(a.rarity) - order.indexOf(b.rarity) || a.name.localeCompare(b.name);
+  });
+
   return `
-    <article class="mini-card rarity-${card.rarity}">
+    <section class="panel catalogue-panel">
+      <div class="reveal-header">
+        <h2>Catalogue</h2>
+        <p class="lead">${state.characterPool.length || 0} cartes dans le pool global</p>
+      </div>
+
+      <h3 class="section-title">Total par rareté</h3>
+      <div class="stats-grid">
+        ${RARITIES.map((r) => {
+          const t = totals[r.id] || 0;
+          return `
+            <button type="button" class="stat-chip filter-chip ${filter === r.id ? 'active' : ''}" style="--rc:${r.color}" data-rarity-filter="${r.id}">
+              <span class="stat-dot"></span>
+              <span class="stat-label">${esc(r.label)}</span>
+              <strong class="stat-value">${t}</strong>
+            </button>`;
+        }).join('')}
+      </div>
+
+      <div class="filter-bar">
+        <button type="button" class="chip ${filter === 'all' ? 'active' : ''}" data-rarity-filter="all">Toutes (${state.characterPool.length})</button>
+        ${RARITIES.map(
+          (r) =>
+            `<button type="button" class="chip ${filter === r.id ? 'active' : ''}" data-rarity-filter="${r.id}" style="--rc:${r.color}">${esc(r.label)}</button>`
+        ).join('')}
+      </div>
+
+      <h3 class="section-title">Toutes les cartes (${sorted.length})</h3>
+      <div class="legend">
+        ${RARITIES.map((r) => `<span style="--rc:${r.color}"><i></i>${esc(r.label)}</span>`).join('')}
+        <span class="owned-legend"><i class="owned-dot"></i>Possédée</span>
+      </div>
+      <div class="collection-grid">
+        ${
+          !state.poolReady
+            ? '<p class="muted">Chargement du pool…</p>'
+            : sorted.length
+              ? sorted.map((c) => miniCardHtml(c, false, owned.has(c.id))).join('')
+              : '<p class="muted">Aucune carte pour ce filtre.</p>'
+        }
+      </div>
+    </section>
+  `;
+}
+
+function miniCardHtml(card, showCount = false, isOwned = false) {
+  const ownedClass = isOwned ? 'owned' : '';
+  return `
+    <article class="mini-card clickable-card rarity-${card.rarity} ${ownedClass}" data-char-id="${card.id}" role="button" tabindex="0" aria-label="Voir ${escAttr(card.name)}">
       <div class="mini-art">
         <img src="${escAttr(card.image)}" alt="${escAttr(card.name)}" loading="lazy" />
         <span class="mini-badge" style="--rc:${card.rarityColor}">${esc(card.rarityLabel)}</span>
         ${showCount && card.count > 1 ? `<span class="count">×${card.count}</span>` : ''}
+        ${isOwned ? '<span class="owned-badge">✓</span>' : ''}
       </div>
       <p class="mini-name">${esc(card.name)}</p>
       ${card.animeTitle ? `<p class="mini-anime">${esc(card.animeTitle)}</p>` : ''}
@@ -483,11 +668,90 @@ function miniCardHtml(card, showCount = false) {
   `;
 }
 
+function modalHtml() {
+  const m = state.modal;
+  if (!m) return '';
+  const card = m.card || {};
+  const d = m.detail;
+
+  let body = '';
+  if (m.status === 'loading') {
+    body = `
+      <div class="modal-loading">
+        <div class="spinner"></div>
+        <p>Chargement de ${esc(card.name)}…</p>
+      </div>`;
+  } else if (m.status === 'error') {
+    body = `
+      <div class="modal-error">
+        <p>${esc(m.error || 'Erreur')}</p>
+        <button type="button" class="btn ghost" id="modal-retry" data-char-id="${card.id}">Réessayer</button>
+      </div>`;
+  } else if (d) {
+    const about = (d.about || '').trim();
+    const nicknames = d.nicknames || [];
+    const animeList = d.anime || [];
+    body = `
+      <div class="modal-hero">
+        <div class="modal-art rarity-${card.rarity || 'commun'}">
+          <img src="${escAttr(d.image || card.image)}" alt="${escAttr(d.name || card.name)}" />
+        </div>
+        <div class="modal-meta">
+          <h2 id="modal-title">${esc(d.name || card.name)}</h2>
+          ${d.nameKanji ? `<p class="modal-kanji">${esc(d.nameKanji)}</p>` : ''}
+          ${card.rarityLabel ? `<span class="rarity-badge inline-badge" style="--rc:${card.rarityColor || '#94a3b8'}">${esc(card.rarityLabel)}</span>` : ''}
+          <p class="modal-fav">★ ${Number(d.favorites || card.favorites || 0).toLocaleString('fr-FR')} favoris</p>
+          ${
+            nicknames.length
+              ? `<p class="modal-nicks"><span class="muted">Surnoms :</span> ${nicknames.map((n) => esc(n)).join(', ')}</p>`
+              : ''
+          }
+          ${
+            d.url
+              ? `<a class="btn ghost sm mal-link" href="${escAttr(d.url)}" target="_blank" rel="noopener">Voir sur MyAnimeList</a>`
+              : ''
+          }
+        </div>
+      </div>
+      <div class="modal-section">
+        <h3>À propos</h3>
+        <p class="modal-about">${about ? esc(about).replace(/\n/g, '<br>') : '<span class="muted">Pas de biographie disponible.</span>'}</p>
+      </div>
+      <div class="modal-section">
+        <h3>Apparitions anime (${animeList.length})</h3>
+        ${
+          animeList.length
+            ? `<ul class="modal-anime-list">${animeList
+                .slice(0, 40)
+                .map(
+                  (a) =>
+                    `<li><strong>${esc(a.title)}</strong> <span class="muted">· ${esc(roleFr(a.role) || a.role || '—')}</span></li>`
+                )
+                .join('')}${
+                animeList.length > 40
+                  ? `<li class="muted">… et ${animeList.length - 40} autres</li>`
+                  : ''
+              }</ul>`
+            : '<p class="muted">Aucune apparition listée.</p>'
+        }
+      </div>`;
+  }
+
+  return `
+    <div class="modal-backdrop" id="modal-backdrop" role="presentation">
+      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <button type="button" class="modal-close" id="modal-close" aria-label="Fermer">×</button>
+        <div class="modal-body">${body}</div>
+      </div>
+    </div>
+  `;
+}
+
 function roleFr(role) {
   const r = (role || '').toLowerCase();
   if (r === 'main') return 'Principal';
   if (r === 'supporting') return 'Secondaire';
-  return 'Caméo';
+  return role ? 'Caméo' : '';
 }
 
 function esc(s) {
@@ -515,6 +779,47 @@ function bindEvents() {
   document.getElementById('reveal-next')?.addEventListener('click', revealNext);
   document.getElementById('skip-all')?.addEventListener('click', skipAll);
   document.getElementById('to-collection')?.addEventListener('click', finishReveal);
+
+  document.querySelectorAll('[data-rarity-filter]').forEach((el) => {
+    el.addEventListener('click', () => {
+      state.catalogueFilter = el.dataset.rarityFilter || 'all';
+      render();
+    });
+  });
+
+  document.querySelectorAll('[data-char-id]').forEach((el) => {
+    if (el.id === 'modal-retry') return;
+    const open = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openCharacterModal(el.dataset.charId);
+    };
+    el.addEventListener('click', open);
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') open(e);
+    });
+  });
+
+  document.getElementById('modal-close')?.addEventListener('click', closeModal);
+  document.getElementById('modal-backdrop')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-backdrop') closeModal();
+  });
+  document.getElementById('modal-retry')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openCharacterModal(e.currentTarget.dataset.charId);
+  });
+
+  if (escapeHandler) {
+    document.removeEventListener('keydown', escapeHandler);
+    escapeHandler = null;
+  }
+  if (state.modal) {
+    escapeHandler = (e) => {
+      if (e.key === 'Escape') closeModal();
+    };
+    document.addEventListener('keydown', escapeHandler);
+  }
 }
 
 init();

@@ -161,3 +161,32 @@ export const GLOBAL_ANIME_IDS = [
 
 /** @deprecated alias — gardé pour compat */
 export const POPULAR_SHORTCUTS = GLOBAL_ANIME_IDS;
+
+/**
+ * Détail complet d'un personnage (bio, nicknames, apparitions anime, etc.).
+ */
+export async function getCharacterFull(characterId) {
+  const data = await fetchJson(`/characters/${characterId}/full`);
+  const c = data.data;
+  if (!c) throw new Error('Personnage introuvable');
+
+  return {
+    id: c.mal_id,
+    name: formatName(c.name),
+    nameKanji: c.name_kanji || '',
+    nicknames: Array.isArray(c.nicknames) ? c.nicknames.filter(Boolean) : [],
+    about: c.about || '',
+    favorites: c.favorites ?? 0,
+    image:
+      c.images?.jpg?.image_url ||
+      c.images?.webp?.image_url ||
+      '',
+    url: c.url || (c.mal_id ? `https://myanimelist.net/character/${c.mal_id}` : ''),
+    anime: (c.anime || []).map((row) => ({
+      role: row.role || '',
+      title: row.anime?.title || 'Anime inconnu',
+      malId: row.anime?.mal_id,
+      url: row.anime?.url || '',
+    })),
+  };
+}
