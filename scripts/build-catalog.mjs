@@ -33,12 +33,20 @@ function loadEnv() {
 loadEnv();
 
 const JIKAN = 'https://api.jikan.moe/v4';
+// Tenrai / mirrors: Jikan-compatible when api.jikan.moe returns 504
+const API_BASES = [
+  'https://api.jikan.moe/v4',
+  'https://api.tenrai.org/v1',
+  'https://jikan.lucashdo.com/v1',
+];
 const GIPHY = 'https://api.giphy.com/v1/gifs/search';
-const MIN_INTERVAL_MS = 750;
-const RETRY_BACKOFF_MS = [3000, 8000, 18000, 35000, 60000];
+const MIN_INTERVAL_MS = 1200;
+/** Longer gaps beat rapid 504 storms on Jikan gateways */
+const RETRY_BACKOFF_MS = [12000, 35000, 70000];
 const RETRY_STATUSES = new Set([429, 504, 502, 503]);
 const GIPHY_INTERVAL_MS = 350;
-const MAX_PASSES = 6;
+const MAX_PASSES = 8;
+const FAIL_STREAK_PAUSE_MS = 120000;
 
 /** Aligned with src/jikan.js GLOBAL_ANIME_IDS */
 const GLOBAL_ANIME_IDS = [
@@ -122,61 +130,67 @@ function sleep(ms) {
 let lastRequestAt = 0;
 let consecutive504 = 0;
 
-async function jikanFetch(path) {
-  const maxAttempts = 1 + RETRY_BACKOFF_MS.length;
-  let lastErr;
-
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const wait = Math.max(0, MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
-    if (wait) await sleep(wait);
-    // Extra cool-down after a streak of gateway errors
-    if (consecutive504 >= 2) {
-      const cool = Math.min(45000, 8000 * consecutive504);
-      console.warn(`  … cool-down ${cool}ms after ${consecutive504}×504`);
-      await sleep(cool);
-      consecutive504 = 0;
-    }
-    lastRequestAt = Date.now();
-
-    try {
-      const res = await fetch(`${JIKAN}${path}`, {
-        headers: { Accept: 'application/json', 'User-Agent': 'anime-pack-opener-catalog/1.1' },
-      });
-      if (RETRY_STATUSES.has(res.status)) {
-        lastErr = new Error(`Jikan ${res.status}`);
-        if (res.status === 504 || res.status === 502 || res.status === 503) consecutive504 += 1;
-        if (attempt < RETRY_BACKOFF_MS.length) {
-          const backoff = RETRY_BACKOFF_MS[attempt];
-          console.warn(`  ↻ ${res.status} → retry in ${backoff}ms (${path})`);
-          await sleep(backoff);
-          lastRequestAt = Date.now();
-          continue;
-        }
-        throw lastErr;
-      }
-      if (!res.ok) throw new Error(`Jikan ${res.status}`);
-      consecutive504 = 0;
-      return await res.json();
-    } catch (e) {
-      lastErr = e;
-      const msg = String(e?.message || '');
-      const retryable =
-        e instanceof TypeError || /Jikan (429|504|502|503)/.test(msg) || /fetch failed/i.test(msg);
-      if (retryable && attempt < RETRY_BACKOFF_MS.length) {
-        const backoff = RETRY_BACKOFF_MS[attempt];
-        console.warn(`  ↻ ${msg} → retry in ${backoff}ms (${path})`);
-        await sleep(backoff);
-        lastRequestAt = Date.now();
-        continue;
-      }
-      throw e;
-    }
-  }
-  throw lastErr || new Error('Jikan request failed');
+async function fetchFromBase(base, path) {
+  const wait = Math.max(0, MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
+  if (wait) await sleep(wait);
+  lastRequestAt = Date.now();
+  const res = await fetch(`${base}${path}`, {
+    headers: { Accept: 'application/json', 'User-Agent': 'anime-pack-opener-catalog/1.3' },
+    signal: AbortSignal.timeout(45000),
+  });
+  return res;
 }
 
-async function getAnimeCharacters(animeId) {
-  const data = await jikanFetch(`/anime/${animeId}/characters`);
+async function jikanFetch(path, opts = {}) {
+  const backoffs = opts.backoffs || RETRY_BACKOFF_MS;
+  const maxAttempts = 1 + backoffs.length;
+  let lastErr;
+  const bases = opts.bases || API_BASES;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Rotate bases: try primary, then fallbacks within the same attempt
+    for (let bi = 0; bi < bases.length; bi++) {
+      const base = bases[(attempt + bi) % bases.length];
+      const short = base.replace(/^https?:\/\//, '').split('/')[0];
+      try {
+        if (consecutive504 >= 3 && bi === 0) {
+          const cool = Math.min(60000, 10000 * consecutive504);
+          console.warn(`  … cool-down ${cool}ms after ${consecutive504}×504`);
+          await sleep(cool);
+          consecutive504 = 0;
+        }
+        const res = await fetchFromBase(base, path);
+        if (RETRY_STATUSES.has(res.status)) {
+          lastErr = new Error(`${short} ${res.status}`);
+          if (res.status === 504 || res.status === 502 || res.status === 503) consecutive504 += 1;
+          console.warn(`  ↻ ${short} ${res.status} — try next mirror`);
+          continue; // next base
+        }
+        if (!res.ok) {
+          lastErr = new Error(`${short} ${res.status}`);
+          continue;
+        }
+        consecutive504 = 0;
+        return await res.json();
+      } catch (e) {
+        lastErr = e;
+        const msg = String(e?.message || e?.name || '');
+        console.warn(`  ↻ ${short} ${msg} — try next mirror`);
+        if (/504|502|503/.test(msg)) consecutive504 += 1;
+      }
+    }
+    if (attempt < backoffs.length) {
+      const backoff = backoffs[attempt];
+      console.warn(`  ↻ all mirrors failed → wait ${backoff}ms then retry`);
+      await sleep(backoff);
+      lastRequestAt = Date.now();
+    }
+  }
+  throw lastErr || new Error('Character API request failed');
+}
+
+async function getAnimeCharacters(animeId, opts = {}) {
+  const data = await jikanFetch(`/anime/${animeId}/characters`, opts);
   return (data.data || [])
     .filter((row) => row.character?.images?.jpg?.image_url)
     .map((row) => ({
@@ -241,19 +255,61 @@ function loadExistingCatalog(merged) {
   }
 }
 
-async function fetchPass(animeList, merged, label) {
+function cardsFromMerged(merged) {
+  return [...merged.values()]
+    .map(assignRarity)
+    .map((c) => {
+      const out = {
+        id: c.id,
+        name: c.name,
+        image: c.image,
+        imageStill: c.imageStill || c.image,
+        role: c.role,
+        favorites: c.favorites ?? 0,
+        animeTitle: c.animeTitle,
+        animeId: c.animeId,
+        rarity: c.rarity,
+        rarityLabel: c.rarityLabel,
+        rarityColor: c.rarityColor,
+      };
+      if (c.imageGif) out.imageGif = c.imageGif;
+      return out;
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function writeCatalogSnapshot(merged, note = '') {
+  const cards = cardsFromMerged(merged);
+  mkdirSync(dirname(OUT), { recursive: true });
+  writeFileSync(OUT, JSON.stringify(cards));
+  if (note) console.log(`  💾 snapshot ${cards.length} chars ${note}`);
+  return cards;
+}
+
+async function fetchPass(animeList, merged, label, opts = {}) {
   const failed = [];
   const total = animeList.length;
+  let failStreak = 0;
+  const fetchOpts = opts.backoffs ? { backoffs: opts.backoffs } : {};
   for (let i = 0; i < total; i++) {
     const anime = animeList[i];
     process.stdout.write(`${label} [${i + 1}/${total}] ${anime.title} (${anime.id})… `);
     try {
-      const chars = await getAnimeCharacters(anime.id);
+      const chars = await getAnimeCharacters(anime.id, fetchOpts);
       for (const c of chars) mergeCharacter(merged, c, anime);
       console.log(`${chars.length} chars (pool ${merged.size})`);
+      failStreak = 0;
+      writeCatalogSnapshot(merged, `(after ${anime.title})`);
     } catch (e) {
       console.log(`FAIL: ${e.message}`);
       failed.push(anime);
+      failStreak += 1;
+      if (failStreak >= 3) {
+        console.warn(`  … ${failStreak} fails in a row — pausing ${FAIL_STREAK_PAUSE_MS}ms`);
+        await sleep(FAIL_STREAK_PAUSE_MS);
+        failStreak = 0;
+        consecutive504 = 0;
+      }
     }
   }
   return failed;
@@ -381,6 +437,70 @@ async function enrichLegendariesWithGiphy(cards) {
   return cards;
 }
 
+/** Single-try sweep: merge hits immediately, return only failures for later passes. */
+async function probeAndMerge(list, merged) {
+  console.log(`Preflight probe+merge of ${list.length} anime (single try each)…`);
+  const bad = [];
+  let hits = 0;
+  for (const anime of list) {
+    const wait = Math.max(0, MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
+    if (wait) await sleep(wait);
+    lastRequestAt = Date.now();
+    process.stdout.write(`  ? ${anime.title} (${anime.id})… `);
+    try {
+      let data = null;
+      let lastStatus = '';
+      for (const base of API_BASES) {
+        const short = base.replace(/^https?:\/\//, '').split('/')[0];
+        const wait = Math.max(0, MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
+        if (wait) await sleep(wait);
+        lastRequestAt = Date.now();
+        try {
+          const res = await fetch(`${base}/anime/${anime.id}/characters`, {
+            headers: { Accept: 'application/json', 'User-Agent': 'anime-pack-opener-catalog/1.3' },
+            signal: AbortSignal.timeout(25000),
+          });
+          if (!res.ok) {
+            lastStatus = `${short}:${res.status}`;
+            if (RETRY_STATUSES.has(res.status)) consecutive504 += 1;
+            continue;
+          }
+          data = await res.json();
+          consecutive504 = 0;
+          break;
+        } catch (e) {
+          lastStatus = `${short}:${e.message || e.name}`;
+        }
+      }
+      if (!data) {
+        console.log(`✗ ${lastStatus || 'all mirrors'}`);
+        bad.push(anime);
+        continue;
+      }
+      consecutive504 = 0;
+      const chars = (data.data || [])
+        .filter((row) => row.character?.images?.jpg?.image_url)
+        .map((row) => ({
+          id: row.character.mal_id,
+          name: formatName(row.character.name),
+          image: row.character.images.jpg.image_url,
+          role: row.role || 'Supporting',
+          favorites: row.favorites ?? 0,
+        }))
+        .filter((c) => !isQuestionMark(c.image));
+      for (const c of chars) mergeCharacter(merged, c, anime);
+      hits += 1;
+      console.log(`✓ ${chars.length} chars (pool ${merged.size})`);
+      writeCatalogSnapshot(merged, `(preflight ${anime.title})`);
+    } catch (e) {
+      console.log(`✗ ${e.message || e.name}`);
+      bad.push(anime);
+    }
+  }
+  console.log(`Preflight done: ${hits} merged, ${bad.length} to retry`);
+  return bad;
+}
+
 async function build() {
   const merged = new Map();
   loadExistingCatalog(merged);
@@ -394,37 +514,25 @@ async function build() {
   console.log(
     `Building catalog from ${pending.length} anime (${missingFirst.length} not in catalog yet)…`
   );
+  pending = await probeAndMerge(pending, merged);
 
-  pending = await fetchPass(pending, merged, 'pass1');
+  // Early passes: fail-fast to cycle IDs while Jikan is flaky
+  if (pending.length) {
+    console.log(`\nPass 1 (fail-fast): ${pending.length} anime…`);
+    pending = await fetchPass(pending, merged, 'pass1', { backoffs: [8000] });
+  }
 
   for (let pass = 2; pass <= MAX_PASSES && pending.length; pass++) {
-    const cool = Math.min(90000, 15000 * (pass - 1));
-    console.log(`\nPass ${pass}: retrying ${pending.length} failed (cooldown ${cool}ms)…`);
+    const cool = Math.min(180000, 20000 * (pass - 1));
+    const backoffs =
+      pass <= 3 ? [10000, 25000] : pass <= 5 ? [15000, 40000, 70000] : RETRY_BACKOFF_MS;
+    console.log(`\nPass ${pass}: retrying ${pending.length} failed (cooldown ${cool}ms, ${backoffs.length + 1} attempts)…`);
     await sleep(cool);
-    pending = await fetchPass(pending, merged, `pass${pass}`);
+    pending = await fetchPass(pending, merged, `pass${pass}`, { backoffs });
   }
 
   // Re-apply favorites-only rarity; preserve baked Giphy URLs
-  let cards = [...merged.values()]
-    .map(assignRarity)
-    .map((c) => {
-      const out = {
-        id: c.id,
-        name: c.name,
-        image: c.image,
-        imageStill: c.imageStill || c.image,
-        role: c.role,
-        favorites: c.favorites ?? 0,
-        animeTitle: c.animeTitle,
-        animeId: c.animeId,
-        rarity: c.rarity,
-        rarityLabel: c.rarityLabel,
-        rarityColor: c.rarityColor,
-      };
-      if (c.imageGif) out.imageGif = c.imageGif;
-      return out;
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
+  let cards = cardsFromMerged(merged);
 
   if (cards.length < 500) {
     console.error(`Catalog too small (${cards.length}) — aborting before Giphy`);
