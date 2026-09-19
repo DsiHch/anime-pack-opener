@@ -74,20 +74,6 @@ export function debounce(fn, ms = 450) {
   };
 }
 
-export async function searchAnime(query, limit = 12) {
-  const q = query.trim();
-  if (q.length < 2) return [];
-  const data = await fetchJson(
-    `/anime?q=${encodeURIComponent(q)}&limit=${limit}&sfw=true&order_by=popularity&sort=asc`
-  );
-  return (data.data || []).map(normalizeAnime);
-}
-
-export async function getTopAnime(limit = 12) {
-  const data = await fetchJson(`/top/anime?filter=bypopularity&limit=${limit}`);
-  return (data.data || []).map(normalizeAnime);
-}
-
 export async function getAnimeCharacters(animeId) {
   const data = await fetchJson(`/anime/${animeId}/characters`);
   return (data.data || [])
@@ -100,6 +86,47 @@ export async function getAnimeCharacters(animeId) {
       favorites: row.favorites ?? 0,
     }))
     .filter((c) => !isQuestionMark(c.image));
+}
+
+/**
+ * Charge les personnages d'une liste fixe d'animes, fusionne et déduplique par id.
+ */
+export async function fetchGlobalCharacterPool(animeList = GLOBAL_ANIME_IDS) {
+  const merged = new Map();
+
+  for (const anime of animeList) {
+    try {
+      const chars = await getAnimeCharacters(anime.id);
+      for (const c of chars) {
+        const prev = merged.get(c.id);
+        if (!prev) {
+          merged.set(c.id, { ...c, animeTitle: anime.title, animeId: anime.id });
+          continue;
+        }
+        // Préférer Main, puis plus de favorites
+        const prevMain = (prev.role || '').toLowerCase() === 'main';
+        const nextMain = (c.role || '').toLowerCase() === 'main';
+        const betterRole = nextMain && !prevMain;
+        const betterFav = (c.favorites || 0) > (prev.favorites || 0);
+        if (betterRole || (!prevMain && betterFav) || (prevMain === nextMain && betterFav)) {
+          merged.set(c.id, {
+            ...c,
+            role: nextMain ? c.role : prev.role,
+            favorites: Math.max(c.favorites || 0, prev.favorites || 0),
+            animeTitle: anime.title,
+            animeId: anime.id,
+          });
+        } else {
+          prev.favorites = Math.max(prev.favorites || 0, c.favorites || 0);
+          if (nextMain) prev.role = c.role;
+        }
+      }
+    } catch {
+      // Continue avec les autres animes si un échoue
+    }
+  }
+
+  return [...merged.values()];
 }
 
 function isQuestionMark(url) {
@@ -116,19 +143,8 @@ function formatName(name) {
   return name;
 }
 
-function normalizeAnime(a) {
-  return {
-    id: a.mal_id,
-    title: a.title_english || a.title || a.title_japanese || `Anime #${a.mal_id}`,
-    image: a.images?.jpg?.image_url || a.images?.webp?.image_url || '',
-    score: a.score,
-    episodes: a.episodes,
-    year: a.year || a.aired?.prop?.from?.year || null,
-  };
-}
-
-/** Animes populaires affichés en raccourcis (IDs MAL connus). */
-export const POPULAR_SHORTCUTS = [
+/** Animes populaires du pool global (IDs MAL connus). */
+export const GLOBAL_ANIME_IDS = [
   { id: 21, title: 'One Piece' },
   { id: 20, title: 'Naruto' },
   { id: 5114, title: 'Fullmetal Alchemist: Brotherhood' },
@@ -142,3 +158,6 @@ export const POPULAR_SHORTCUTS = [
   { id: 31964, title: 'My Hero Academia' },
   { id: 1, title: 'Cowboy Bebop' },
 ];
+
+/** @deprecated alias — gardé pour compat */
+export const POPULAR_SHORTCUTS = GLOBAL_ANIME_IDS;

@@ -1,39 +1,103 @@
 import './style.css';
-import {
-  searchAnime,
-  getTopAnime,
-  getAnimeCharacters,
-  debounce,
-  POPULAR_SHORTCUTS,
-} from './jikan.js';
+import { fetchGlobalCharacterPool, GLOBAL_ANIME_IDS } from './jikan.js';
 import { enrichPool, openPack, RARITIES, PACK_SIZE } from './rarity.js';
 
+const COOLDOWN_MS = 5 * 60 * 1000;
+const LS_COLLECTION = 'apo-collection';
+const LS_LAST_OPEN = 'apo-lastPackOpenAt';
+
 const state = {
-  view: 'select', // select | loading | reveal | collection
-  selectedAnime: null,
+  tab: 'open', // open | collection
+  view: 'home', // home | loading | reveal
   characterPool: [],
+  poolReady: false,
   currentPack: [],
   revealIndex: -1,
+  /** true only for the render that first shows a newly revealed card (avoids double flip) */
+  justRevealed: false,
   collection: loadCollection(),
-  searchResults: [],
-  popular: [],
   error: null,
   revealing: false,
-  searchQuery: '',
+  lastPackOpenAt: loadLastPackOpenAt(),
+  cooldownLeftMs: 0,
 };
+
+let cooldownTimer = null;
 
 const app = document.querySelector('#app');
 
 function loadCollection() {
   try {
-    return JSON.parse(localStorage.getItem('apo-collection') || '[]');
+    return JSON.parse(localStorage.getItem(LS_COLLECTION) || '[]');
   } catch {
     return [];
   }
 }
 
 function saveCollection() {
-  localStorage.setItem('apo-collection', JSON.stringify(state.collection));
+  localStorage.setItem(LS_COLLECTION, JSON.stringify(state.collection));
+}
+
+function loadLastPackOpenAt() {
+  const raw = localStorage.getItem(LS_LAST_OPEN);
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function saveLastPackOpenAt(ts) {
+  state.lastPackOpenAt = ts;
+  localStorage.setItem(LS_LAST_OPEN, String(ts));
+}
+
+function cooldownRemaining() {
+  if (!state.lastPackOpenAt) return 0;
+  return Math.max(0, state.lastPackOpenAt + COOLDOWN_MS - Date.now());
+}
+
+function canOpenPack() {
+  return cooldownRemaining() === 0;
+}
+
+function formatCountdown(ms) {
+  const total = Math.ceil(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function startCooldownTicker() {
+  stopCooldownTicker();
+  const tick = () => {
+    state.cooldownLeftMs = cooldownRemaining();
+    if (state.tab === 'open' && (state.view === 'home' || state.view === 'loading')) {
+      const btn = document.getElementById('open-pack');
+      const cd = document.getElementById('cooldown-label');
+      if (btn || cd) {
+        // Soft update without full re-render when possible
+        if (state.cooldownLeftMs > 0) {
+          if (btn) {
+            btn.disabled = true;
+            btn.textContent = `Disponible dans ${formatCountdown(state.cooldownLeftMs)}`;
+          }
+          if (cd) cd.textContent = `Prochain booster dans ${formatCountdown(state.cooldownLeftMs)}`;
+        } else if (state.view === 'home' && state.poolReady) {
+          // Refresh home so button becomes active
+          render();
+          return;
+        }
+      }
+    }
+    if (state.cooldownLeftMs <= 0) stopCooldownTicker();
+  };
+  tick();
+  cooldownTimer = setInterval(tick, 1000);
+}
+
+function stopCooldownTicker() {
+  if (cooldownTimer) {
+    clearInterval(cooldownTimer);
+    cooldownTimer = null;
+  }
 }
 
 function addToCollection(cards) {
@@ -43,7 +107,11 @@ function addToCollection(cards) {
     if (prev) {
       prev.count = (prev.count || 1) + 1;
     } else {
-      map.set(card.id, { ...card, count: 1, animeTitle: state.selectedAnime?.title });
+      map.set(card.id, {
+        ...card,
+        count: 1,
+        animeTitle: card.animeTitle || '',
+      });
     }
   }
   state.collection = [...map.values()].sort((a, b) => {
@@ -53,70 +121,75 @@ function addToCollection(cards) {
   saveCollection();
 }
 
-const debouncedSearch = debounce(async (q) => {
-  if (q.trim().length < 2) {
-    state.searchResults = [];
-    render();
-    return;
+function poolTotalsByRarity() {
+  const totals = Object.fromEntries(RARITIES.map((r) => [r.id, 0]));
+  for (const c of state.characterPool) {
+    if (totals[c.rarity] != null) totals[c.rarity] += 1;
   }
-  try {
-    state.searchResults = await searchAnime(q);
-    state.error = null;
-  } catch (e) {
-    state.error = 'Recherche impossible. Réessaie dans un instant.';
-    state.searchResults = [];
+  return totals;
+}
+
+function ownedUniqueByRarity() {
+  const owned = Object.fromEntries(RARITIES.map((r) => [r.id, 0]));
+  for (const c of state.collection) {
+    if (owned[c.rarity] != null) owned[c.rarity] += 1;
   }
-  render();
-}, 480);
+  return owned;
+}
 
 async function init() {
-  render();
-  try {
-    state.popular = await getTopAnime(12);
-  } catch {
-    state.popular = [];
-  }
-  render();
-}
-
-function setView(view) {
-  state.view = view;
-  render();
-}
-
-async function selectAnime(anime) {
-  state.selectedAnime = anime;
-  state.error = null;
   state.view = 'loading';
-  state.revealIndex = -1;
-  state.currentPack = [];
+  state.cooldownLeftMs = cooldownRemaining();
   render();
+  if (state.cooldownLeftMs > 0) startCooldownTicker();
 
   try {
-    const chars = await getAnimeCharacters(anime.id);
-    if (chars.length < PACK_SIZE) {
-      state.error = `Pas assez de personnages (${chars.length}) pour un booster de ${PACK_SIZE}.`;
-      state.view = 'select';
+    const raw = await fetchGlobalCharacterPool(GLOBAL_ANIME_IDS);
+    if (raw.length < PACK_SIZE) {
+      state.error = `Pool trop petit (${raw.length} personnages). Réessaie plus tard.`;
+      state.poolReady = false;
+      state.view = 'home';
       render();
       return;
     }
-    state.characterPool = enrichPool(chars);
-    await startPackOpen();
+    state.characterPool = enrichPool(raw);
+    state.poolReady = true;
+    state.error = null;
+    state.view = 'home';
   } catch (e) {
-    state.error = 'Impossible de charger les personnages. Réessaie.';
-    state.view = 'select';
-    render();
+    state.error = 'Impossible de charger le pool global. Réessaie.';
+    state.poolReady = false;
+    state.view = 'home';
   }
-}
-
-async function startPackOpen() {
-  state.currentPack = openPack(state.characterPool, PACK_SIZE);
-  state.revealIndex = -1;
-  state.revealing = false;
-  state.view = 'reveal';
   render();
 }
 
+function startPackOpen() {
+  if (!state.poolReady || !canOpenPack()) return;
+  if (state.characterPool.length < PACK_SIZE) {
+    state.error = 'Pas assez de personnages dans le pool.';
+    render();
+    return;
+  }
+
+  saveLastPackOpenAt(Date.now());
+  state.cooldownLeftMs = COOLDOWN_MS;
+  startCooldownTicker();
+
+  state.currentPack = openPack(state.characterPool, PACK_SIZE);
+  state.revealIndex = -1;
+  state.revealing = false;
+  state.justRevealed = false;
+  state.view = 'reveal';
+  state.tab = 'open';
+  state.error = null;
+  render();
+}
+
+/**
+ * Reveal next card. justRevealed is true only for the first render of that card
+ * so flip-in runs once; the follow-up render (revealing → false) has no flip-in.
+ */
 function revealNext() {
   if (state.revealing) return;
   if (state.revealIndex >= state.currentPack.length - 1) {
@@ -125,7 +198,9 @@ function revealNext() {
   }
   state.revealing = true;
   state.revealIndex += 1;
+  state.justRevealed = true;
   render();
+  state.justRevealed = false;
 
   const card = state.currentPack[state.revealIndex];
   const delay = card.rarity === 'legendaire' ? 1100 : card.rarity === 'epique' ? 900 : 700;
@@ -137,7 +212,8 @@ function revealNext() {
 
 function finishReveal() {
   addToCollection(state.currentPack);
-  state.view = 'collection';
+  state.tab = 'collection';
+  state.view = 'home';
   render();
 }
 
@@ -146,8 +222,19 @@ function skipAll() {
     state.revealIndex += 1;
   }
   state.revealing = false;
+  state.justRevealed = false;
   render();
   setTimeout(finishReveal, 400);
+}
+
+function setTab(tab) {
+  state.tab = tab;
+  if (tab === 'open' && state.view === 'reveal' && state.currentPack.length) {
+    // stay on reveal
+  } else if (tab === 'open') {
+    state.view = state.poolReady ? 'home' : 'loading';
+  }
+  render();
 }
 
 function render() {
@@ -158,16 +245,22 @@ function render() {
         <span class="brand-mark">✦</span>
         <div>
           <h1>Anime Pack Opener</h1>
-          <p class="tagline">Booster TCG · personnages MyAnimeList</p>
+          <p class="tagline">Booster TCG · pool global MyAnimeList</p>
         </div>
       </div>
       <div class="topbar-meta">
         <span class="pill">${state.collection.length} cartes</span>
       </div>
     </header>
+
+    <nav class="tabs" role="tablist" aria-label="Navigation">
+      <button type="button" class="tab ${state.tab === 'open' ? 'active' : ''}" data-tab="open" role="tab" aria-selected="${state.tab === 'open'}">Ouvrir</button>
+      <button type="button" class="tab ${state.tab === 'collection' ? 'active' : ''}" data-tab="collection" role="tab" aria-selected="${state.tab === 'collection'}">Collection</button>
+    </nav>
+
     <main class="main">
       ${state.error ? `<div class="banner error" role="alert">${esc(state.error)}</div>` : ''}
-      ${viewHtml()}
+      ${state.tab === 'collection' ? collectionHtml() : openTabHtml()}
     </main>
     <footer class="footer">
       Données via <a href="https://jikan.moe" target="_blank" rel="noopener">Jikan API</a> · images MyAnimeList
@@ -176,80 +269,56 @@ function render() {
   bindEvents();
 }
 
-function viewHtml() {
+function openTabHtml() {
   switch (state.view) {
     case 'loading':
       return loadingHtml();
     case 'reveal':
       return revealHtml();
-    case 'collection':
-      return collectionHtml();
     default:
-      return selectHtml();
+      return homeHtml();
   }
 }
 
-function selectHtml() {
-  const results = state.searchResults;
-  const popular = state.popular.length ? state.popular : POPULAR_SHORTCUTS.map((p) => ({
-    ...p,
-    image: '',
-    score: null,
-  }));
+function homeHtml() {
+  const left = cooldownRemaining();
+  const ready = state.poolReady && left === 0;
+  const poolCount = state.characterPool.length;
 
   return `
-    <section class="panel select-panel">
-      <h2>Choisis ton anime</h2>
-      <p class="lead">Recherche un titre ou ouvre un booster depuis un classique.</p>
-      <div class="search-wrap">
-        <input
-          type="search"
-          id="search"
-          class="search"
-          placeholder="Ex. : One Piece, Naruto, Demon Slayer…"
-          autocomplete="off"
-          aria-label="Rechercher un anime"
-        />
+    <section class="panel home-panel center-panel">
+      <h2>Booster global</h2>
+      <p class="lead">
+        Un pool unique tiré de ${GLOBAL_ANIME_IDS.length} animes populaires
+        ${poolCount ? ` · <strong>${poolCount}</strong> personnages` : ''}.
+      </p>
+
+      <button type="button" class="pack-closed ${ready ? '' : 'disabled'}" id="open-pack-visual" ${ready ? '' : 'disabled'} aria-label="Ouvrir le booster">
+        <div class="pack-art">
+          <span class="pack-shine"></span>
+          <strong>BOOSTER</strong>
+          <em>Pool global</em>
+          <span class="pack-count">${PACK_SIZE} cartes</span>
+        </div>
+      </button>
+
+      <div class="home-actions">
+        <button type="button" class="btn primary" id="open-pack" ${ready ? '' : 'disabled'}>
+          ${
+            !state.poolReady
+              ? 'Chargement…'
+              : left > 0
+                ? `Disponible dans ${formatCountdown(left)}`
+                : 'Ouvrir un booster'
+          }
+        </button>
+        ${
+          left > 0
+            ? `<p class="cooldown-label" id="cooldown-label">Prochain booster dans ${formatCountdown(left)}</p>`
+            : `<p class="hint">1 booster toutes les 5 minutes</p>`
+        }
       </div>
-      ${
-        results.length
-          ? `
-        <h3 class="section-title">Résultats</h3>
-        <div class="anime-grid" id="search-grid">
-          ${results.map((a) => animeCardHtml(a)).join('')}
-        </div>`
-          : ''
-      }
-      <h3 class="section-title">Populaires</h3>
-      <div class="chips" id="shortcuts">
-        ${POPULAR_SHORTCUTS.map(
-          (s) => `<button type="button" class="chip" data-shortcut-id="${s.id}" data-shortcut-title="${escAttr(s.title)}">${esc(s.title)}</button>`
-        ).join('')}
-      </div>
-      <div class="anime-grid" id="popular-grid">
-        ${popular.map((a) => animeCardHtml(a)).join('')}
-      </div>
-      ${
-        state.collection.length
-          ? `<button type="button" class="btn ghost" id="goto-collection">Voir ma collection (${state.collection.length})</button>`
-          : ''
-      }
     </section>
-  `;
-}
-
-function animeCardHtml(a) {
-  const img = a.image
-    ? `<img src="${escAttr(a.image)}" alt="" loading="lazy" />`
-    : `<div class="anime-placeholder">◆</div>`;
-  return `
-    <button type="button" class="anime-card" data-anime-id="${a.id}" data-anime-title="${escAttr(a.title)}" data-anime-image="${escAttr(a.image || '')}">
-      <div class="anime-art">${img}</div>
-      <div class="anime-info">
-        <strong>${esc(a.title)}</strong>
-        ${a.score ? `<span class="score">★ ${a.score}</span>` : ''}
-      </div>
-    </button>
   `;
 }
 
@@ -257,9 +326,9 @@ function loadingHtml() {
   return `
     <section class="panel center-panel">
       <div class="spinner"></div>
-      <h2>Invocation du booster…</h2>
-      <p class="lead">${esc(state.selectedAnime?.title || '')}</p>
-      <p class="muted">Chargement des personnages via Jikan</p>
+      <h2>Chargement du pool global…</h2>
+      <p class="lead">Personnages de ${GLOBAL_ANIME_IDS.length} animes populaires</p>
+      <p class="muted">Jikan API · merci de patienter</p>
     </section>
   `;
 }
@@ -273,8 +342,8 @@ function revealHtml() {
   return `
     <section class="panel reveal-panel">
       <div class="reveal-header">
-        <button type="button" class="btn ghost sm" id="back-select">← Changer d'anime</button>
-        <h2>Booster — ${esc(state.selectedAnime?.title || '')}</h2>
+        <span class="pill ghost-pill">Pool global</span>
+        <h2>Ouverture du booster</h2>
         <p class="progress">${Math.max(0, idx + 1)} / ${pack.length}</p>
       </div>
 
@@ -282,17 +351,17 @@ function revealHtml() {
         ${
           idx < 0
             ? `
-          <button type="button" class="pack-closed" id="open-first" aria-label="Ouvrir le booster">
+          <button type="button" class="pack-closed" id="open-first" aria-label="Révéler la première carte">
             <div class="pack-art">
               <span class="pack-shine"></span>
               <strong>BOOSTER</strong>
-              <em>${esc(state.selectedAnime?.title || 'Anime')}</em>
+              <em>Pool global</em>
               <span class="pack-count">${PACK_SIZE} cartes</span>
             </div>
           </button>
           <p class="hint">Touche le booster pour révéler la première carte</p>
         `
-            : cardFaceHtml(current, true)
+            : cardFaceHtml(current, state.justRevealed)
         }
       </div>
 
@@ -339,7 +408,7 @@ function cardFaceHtml(card, animate) {
           </div>
           <div class="tcg-footer">
             <h3>${esc(card.name)}</h3>
-            <span class="role">${esc(roleFr(card.role))}</span>
+            <span class="role">${esc(roleFr(card.role))}${card.animeTitle ? ` · ${esc(card.animeTitle)}` : ''}</span>
           </div>
         </div>
       </div>
@@ -348,34 +417,44 @@ function cardFaceHtml(card, animate) {
 }
 
 function collectionHtml() {
+  const totals = poolTotalsByRarity();
+  const owned = ownedUniqueByRarity();
   const pack = state.currentPack;
-  const hasPack = pack.length > 0;
+  const showPack = pack.length > 0 && state.revealIndex >= pack.length - 1;
+
   return `
     <section class="panel collection-panel">
       <div class="reveal-header">
-        <h2>${hasPack ? 'Pack ouvert !' : 'Ma collection'}</h2>
-        <p class="lead">${hasPack ? `${esc(state.selectedAnime?.title || '')} — ${pack.length} nouvelles cartes` : `${state.collection.length} carte(s) sauvegardée(s)`}</p>
+        <h2>Ma collection</h2>
+        <p class="lead">${state.collection.length} carte(s) unique(s) · pool ${state.characterPool.length || '…'}</p>
+      </div>
+
+      <h3 class="section-title">Progression par rareté</h3>
+      <div class="stats-grid">
+        ${RARITIES.map((r) => {
+          const o = owned[r.id] || 0;
+          const t = totals[r.id] || 0;
+          const label = t ? `${o} / ${t}` : `${o} / —`;
+          return `
+            <div class="stat-chip" style="--rc:${r.color}">
+              <span class="stat-dot"></span>
+              <span class="stat-label">${esc(r.label)}</span>
+              <strong class="stat-value">${label}</strong>
+            </div>`;
+        }).join('')}
       </div>
 
       ${
-        hasPack
+        showPack
           ? `
-      <h3 class="section-title">Ce booster</h3>
+      <h3 class="section-title">Dernier booster</h3>
       <div class="pack-grid">
         ${pack.map((c) => miniCardHtml(c)).join('')}
-      </div>
-
-      <div class="reveal-actions row">
-        <button type="button" class="btn primary" id="open-another">Ouvrir un autre booster</button>
-        <button type="button" class="btn ghost" id="change-anime">Changer d'anime</button>
       </div>`
-          : `
-      <div class="reveal-actions row">
-        <button type="button" class="btn primary" id="change-anime">Choisir un anime</button>
-      </div>`
+          : ''
       }
 
-      <h3 class="section-title">Ma collection (${state.collection.length})</h3>
+      <h3 class="section-title">Cartes possédées (${state.collection.length})</h3>
       <div class="legend">
         ${RARITIES.map((r) => `<span style="--rc:${r.color}"><i></i>${esc(r.label)}</span>`).join('')}
       </div>
@@ -383,7 +462,7 @@ function collectionHtml() {
         ${
           state.collection.length
             ? state.collection.map((c) => miniCardHtml(c, true)).join('')
-            : '<p class="muted">Aucune carte pour l’instant.</p>'
+            : '<p class="muted">Aucune carte pour l’instant. Ouvre un booster !</p>'
         }
       </div>
     </section>
@@ -399,6 +478,7 @@ function miniCardHtml(card, showCount = false) {
         ${showCount && card.count > 1 ? `<span class="count">×${card.count}</span>` : ''}
       </div>
       <p class="mini-name">${esc(card.name)}</p>
+      ${card.animeTitle ? `<p class="mini-anime">${esc(card.animeTitle)}</p>` : ''}
     </article>
   `;
 }
@@ -423,67 +503,18 @@ function escAttr(s) {
 }
 
 function bindEvents() {
-  const search = document.getElementById('search');
-  if (search) {
-    if (state.searchQuery) {
-      search.value = state.searchQuery;
-    }
-    if (state._searchFocused) {
-      search.focus();
-      const len = search.value.length;
-      search.setSelectionRange(len, len);
-    }
-    search.addEventListener('focus', () => { state._searchFocused = true; });
-    search.addEventListener('blur', () => { state._searchFocused = false; });
-    search.addEventListener('input', (e) => {
-      state.searchQuery = e.target.value;
-      state._searchFocused = true;
-      debouncedSearch(e.target.value);
-    });
-  }
-
-  document.querySelectorAll('.anime-card').forEach((el) => {
-    el.addEventListener('click', () => {
-      selectAnime({
-        id: Number(el.dataset.animeId),
-        title: el.dataset.animeTitle,
-        image: el.dataset.animeImage,
-      });
-    });
+  document.querySelectorAll('[data-tab]').forEach((el) => {
+    el.addEventListener('click', () => setTab(el.dataset.tab));
   });
 
-  document.querySelectorAll('[data-shortcut-id]').forEach((el) => {
-    el.addEventListener('click', () => {
-      selectAnime({
-        id: Number(el.dataset.shortcutId),
-        title: el.dataset.shortcutTitle,
-        image: '',
-      });
-    });
-  });
+  const open = () => startPackOpen();
+  document.getElementById('open-pack')?.addEventListener('click', open);
+  document.getElementById('open-pack-visual')?.addEventListener('click', open);
 
   document.getElementById('open-first')?.addEventListener('click', revealNext);
   document.getElementById('reveal-next')?.addEventListener('click', revealNext);
   document.getElementById('skip-all')?.addEventListener('click', skipAll);
   document.getElementById('to-collection')?.addEventListener('click', finishReveal);
-  document.getElementById('open-another')?.addEventListener('click', () => {
-    state.view = 'loading';
-    render();
-    startPackOpen();
-  });
-  document.getElementById('change-anime')?.addEventListener('click', () => {
-    state.view = 'select';
-    state.error = null;
-    render();
-  });
-  document.getElementById('back-select')?.addEventListener('click', () => {
-    state.view = 'select';
-    render();
-  });
-  document.getElementById('goto-collection')?.addEventListener('click', () => {
-    state.view = 'collection';
-    render();
-  });
 }
 
 init();
