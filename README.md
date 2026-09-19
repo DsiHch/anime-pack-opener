@@ -70,7 +70,13 @@ npm run preview
 
 ## Déploiement
 
-GitHub Actions (`.github/workflows/deploy.yml`) construit le projet et publie sur **GitHub Pages** (source : GitHub Actions).
+Le site est publié sur **GitHub Pages** depuis la branche `gh-pages` (build Vite avec `base: /anime-pack-opener/`).
+
+```bash
+./scripts/deploy-pages.sh
+```
+
+Un fichier `.github/workflows/deploy.yml` peut aussi déployer via Actions (nécessite le scope OAuth `workflow` pour être poussé).
 
 ## Limites API
 
