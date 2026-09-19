@@ -17,32 +17,15 @@ Site web public pour ouvrir des boosters TCG de personnages d’anime, avec donn
 
 ## Raretés
 
-La rareté d’un personnage dépend du **rôle** et des **favorites** MAL (`src/rarity.js`) :
+La rareté d’un personnage dépend uniquement du nombre de **favorites MAL** (`src/rarity.js`) :
 
-| Rôle | Bonus score |
-|------|-------------|
-| Principal (Main) | +40 |
-| Secondaire (Supporting) | +15 |
-| Caméo (Appears) | +0 |
-
-| Favorites | Bonus score |
-|-----------|-------------|
-| ≥ 30 000 | +55 |
-| ≥ 15 000 | +45 |
-| ≥ 8 000 | +38 |
-| ≥ 3 000 | +30 |
-| ≥ 1 000 | +22 |
-| ≥ 400 | +14 |
-| ≥ 100 | +8 |
-| ≥ 20 | +4 |
-
-| Score total | Rareté |
-|-------------|--------|
-| ≥ 78 | Légendaire |
-| ≥ 58 | Épique |
-| ≥ 40 | Rare |
-| ≥ 22 | Peu commun |
-| autrement | Commun |
+| Favorites MAL | Rareté |
+|---------------|--------|
+| ≥ 50 000 | Légendaire |
+| ≥ 15 000 | Épique |
+| ≥ 4 000 | Rare |
+| ≥ 800 | Peu commun |
+| < 800 | Commun |
 
 ### Probabilités de tirage dans un booster
 

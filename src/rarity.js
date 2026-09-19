@@ -1,5 +1,5 @@
 /**
- * Rareté dérivée du rôle + favorites MAL.
+ * Rareté dérivée des favorites MAL.
  * Tirage de booster pondéré : communs fréquents, légendaires rares.
  */
 
@@ -18,37 +18,21 @@ export function getRarityMeta(id) {
 }
 
 /**
- * Score → rareté.
- * Main +40, Supporting +15, Appears/autre +0
- * Favorites (échelle log-ish) jusqu'à +55
+ * Favorites MAL → rareté.
+ * Les seuils sont volontairement basés uniquement sur le nombre de favorites.
  */
 export function assignRarity(character) {
-  const role = (character.role || '').toLowerCase();
-  let score = 0;
-
-  if (role === 'main') score += 40;
-  else if (role === 'supporting') score += 15;
-  // Appears / autre : 0
-
   const fav = Number(character.favorites) || 0;
-  if (fav >= 30000) score += 55;
-  else if (fav >= 15000) score += 45;
-  else if (fav >= 8000) score += 38;
-  else if (fav >= 3000) score += 30;
-  else if (fav >= 1000) score += 22;
-  else if (fav >= 400) score += 14;
-  else if (fav >= 100) score += 8;
-  else if (fav >= 20) score += 4;
 
   let id;
-  if (score >= 78) id = 'legendaire';
-  else if (score >= 58) id = 'epique';
-  else if (score >= 40) id = 'rare';
-  else if (score >= 22) id = 'peu-commun';
+  if (fav >= 50000) id = 'legendaire';
+  else if (fav >= 15000) id = 'epique';
+  else if (fav >= 4000) id = 'rare';
+  else if (fav >= 800) id = 'peu-commun';
   else id = 'commun';
 
   const meta = getRarityMeta(id);
-  return { ...character, rarity: id, rarityLabel: meta.label, rarityColor: meta.color, _score: score };
+  return { ...character, rarity: id, rarityLabel: meta.label, rarityColor: meta.color, _score: fav };
 }
 
 export function enrichPool(characters) {
