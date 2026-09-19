@@ -34,10 +34,11 @@ loadEnv();
 
 const JIKAN = 'https://api.jikan.moe/v4';
 const GIPHY = 'https://api.giphy.com/v1/gifs/search';
-const MIN_INTERVAL_MS = 600;
-const RETRY_BACKOFF_MS = [2500, 6000, 12000];
+const MIN_INTERVAL_MS = 750;
+const RETRY_BACKOFF_MS = [3000, 8000, 18000, 35000, 60000];
 const RETRY_STATUSES = new Set([429, 504, 502, 503]);
 const GIPHY_INTERVAL_MS = 350;
+const MAX_PASSES = 6;
 
 /** Aligned with src/jikan.js GLOBAL_ANIME_IDS */
 const GLOBAL_ANIME_IDS = [
@@ -198,6 +199,8 @@ function mergeCharacter(merged, c, anime) {
   const nextMain = (c.role || '').toLowerCase() === 'main';
   const betterRole = nextMain && !prevMain;
   const betterFav = (c.favorites || 0) > (prev.favorites || 0);
+  const keepGif = prev.imageGif;
+  const keepStill = prev.imageStill || prev.image;
   if (betterRole || (!prevMain && betterFav) || (prevMain === nextMain && betterFav)) {
     merged.set(c.id, {
       ...c,
@@ -205,10 +208,36 @@ function mergeCharacter(merged, c, anime) {
       favorites: Math.max(c.favorites || 0, prev.favorites || 0),
       animeTitle: anime.title,
       animeId: anime.id,
+      imageGif: keepGif || c.imageGif,
+      imageStill: keepStill || c.imageStill || c.image,
     });
   } else {
     prev.favorites = Math.max(prev.favorites || 0, c.favorites || 0);
-    if (nextMain) prev.role = c.role;
+    if (nextMain) {
+      prev.role = c.role;
+      prev.animeTitle = anime.title;
+      prev.animeId = anime.id;
+    }
+    if (c.image && !isQuestionMark(c.image)) prev.image = c.image;
+  }
+}
+
+/** Seed merged map from existing public/catalog.json so successes are not wiped. */
+function loadExistingCatalog(merged) {
+  if (!existsSync(OUT)) {
+    console.log('No existing catalog — starting fresh');
+    return;
+  }
+  try {
+    const raw = JSON.parse(readFileSync(OUT, 'utf8'));
+    const list = Array.isArray(raw) ? raw : [];
+    for (const c of list) {
+      if (!c?.id) continue;
+      merged.set(c.id, { ...c });
+    }
+    console.log(`Loaded existing catalog: ${merged.size} characters (will merge, not wipe)`);
+  } catch (e) {
+    console.warn(`Could not load existing catalog: ${e.message}`);
   }
 }
 
@@ -316,7 +345,12 @@ async function searchGiphy(name, animeTitle) {
 
 async function enrichLegendariesWithGiphy(cards) {
   const legends = cards.filter((c) => c.rarity === 'legendaire');
-  console.log(`\nGiphy enrich: ${legends.length} légendaires…`);
+  const need = legends.filter(
+    (c) => !c.imageGif || !String(c.imageGif).includes('giphy.com')
+  );
+  const already = legends.length - need.length;
+  console.log(`\nGiphy enrich: ${need.length} new légendaires (${already} already have Giphy)…`);
+  if (!need.length) return cards;
   if (!process.env.GIPHY_API_KEY) {
     console.warn('GIPHY_API_KEY not set — skipping GIF enrichment');
     return cards;
@@ -324,9 +358,9 @@ async function enrichLegendariesWithGiphy(cards) {
 
   let ok = 0;
   let miss = 0;
-  for (let i = 0; i < legends.length; i++) {
-    const c = legends[i];
-    process.stdout.write(`  [${i + 1}/${legends.length}] ${c.name} (${c.animeTitle})… `);
+  for (let i = 0; i < need.length; i++) {
+    const c = need[i];
+    process.stdout.write(`  [${i + 1}/${need.length}] ${c.name} (${c.animeTitle})… `);
     try {
       const gif = await searchGiphy(c.name, c.animeTitle || '');
       if (gif) {
@@ -349,33 +383,47 @@ async function enrichLegendariesWithGiphy(cards) {
 
 async function build() {
   const merged = new Map();
-  let pending = [...GLOBAL_ANIME_IDS];
+  loadExistingCatalog(merged);
 
-  console.log(`Building catalog from ${pending.length} anime…`);
+  // Prefer re-fetching anime not yet represented, but still refresh all IDs
+  const presentAnimeIds = new Set([...merged.values()].map((c) => c.animeId).filter(Boolean));
+  let pending = [...GLOBAL_ANIME_IDS];
+  const missingFirst = pending.filter((a) => !presentAnimeIds.has(a.id));
+  const presentFirst = pending.filter((a) => presentAnimeIds.has(a.id));
+  pending = [...missingFirst, ...presentFirst];
+  console.log(
+    `Building catalog from ${pending.length} anime (${missingFirst.length} not in catalog yet)…`
+  );
+
   pending = await fetchPass(pending, merged, 'pass1');
 
-  for (let pass = 2; pass <= 4 && pending.length; pass++) {
-    const cool = 10000 * (pass - 1);
+  for (let pass = 2; pass <= MAX_PASSES && pending.length; pass++) {
+    const cool = Math.min(90000, 15000 * (pass - 1));
     console.log(`\nPass ${pass}: retrying ${pending.length} failed (cooldown ${cool}ms)…`);
     await sleep(cool);
     pending = await fetchPass(pending, merged, `pass${pass}`);
   }
 
+  // Re-apply favorites-only rarity; preserve baked Giphy URLs
   let cards = [...merged.values()]
     .map(assignRarity)
-    .map((c) => ({
-      id: c.id,
-      name: c.name,
-      image: c.image,
-      imageStill: c.image,
-      role: c.role,
-      favorites: c.favorites ?? 0,
-      animeTitle: c.animeTitle,
-      animeId: c.animeId,
-      rarity: c.rarity,
-      rarityLabel: c.rarityLabel,
-      rarityColor: c.rarityColor,
-    }))
+    .map((c) => {
+      const out = {
+        id: c.id,
+        name: c.name,
+        image: c.image,
+        imageStill: c.imageStill || c.image,
+        role: c.role,
+        favorites: c.favorites ?? 0,
+        animeTitle: c.animeTitle,
+        animeId: c.animeId,
+        rarity: c.rarity,
+        rarityLabel: c.rarityLabel,
+        rarityColor: c.rarityColor,
+      };
+      if (c.imageGif) out.imageGif = c.imageGif;
+      return out;
+    })
     .sort((a, b) => a.name.localeCompare(b.name));
 
   if (cards.length < 500) {
@@ -389,14 +437,18 @@ async function build() {
   for (const r of RARITIES) byRarity[r.id] = 0;
   for (const c of cards) byRarity[c.rarity] += 1;
   const withGif = cards.filter((c) => c.imageGif).length;
+  const animeCovered = new Set(cards.map((c) => c.animeId));
+  const failedFinal = GLOBAL_ANIME_IDS.filter((a) => !animeCovered.has(a.id));
 
   mkdirSync(dirname(OUT), { recursive: true });
   writeFileSync(OUT, JSON.stringify(cards));
   console.log(`\nWrote ${cards.length} characters → ${OUT}`);
   console.log('Rarity breakdown:', byRarity);
   console.log(`Legendaries with Giphy GIF: ${withGif}`);
-  if (pending.length) {
-    console.warn('Still failed anime:', pending.map((a) => a.title).join(', '));
+  console.log(`Anime covered: ${animeCovered.size}/${GLOBAL_ANIME_IDS.length}`);
+  if (pending.length || failedFinal.length) {
+    const still = pending.length ? pending : failedFinal;
+    console.warn('Still failed / missing anime:', still.map((a) => `${a.title} (${a.id})`).join(', '));
   }
 }
 

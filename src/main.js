@@ -776,24 +776,22 @@ function modalHtml() {
         <button type="button" class="btn ghost" id="modal-retry" data-char-id="${card.id}">Réessayer</button>
       </div>`;
   } else if (d) {
-    const about = (d.about || '').trim();
     const nicknames = d.nicknames || [];
     const animeList = d.anime || [];
     const pictures = (d.pictures || []).filter(Boolean);
     const showGallery = pictures.length > 1;
+    // Local catalog already has name/image/rarity/role/anime — no scary banner.
+    // Soft retry only when enrichment (nicknames / full anime list) may still help.
+    const wantEnrichRetry = limited && !loading && (!nicknames.length || animeList.length <= 1);
     body = `
-      ${
-        limited
-          ? `<div class="modal-limited-banner" role="status">
-              Infos limitées (API temporairement indisponible)
-              <button type="button" class="btn ghost sm" id="modal-retry" data-char-id="${card.id}">Réessayer</button>
-            </div>`
-          : ''
-      }
       ${
         loading
           ? `<div class="modal-loading-inline"><div class="spinner sm"></div><span>Enrichissement des infos…</span></div>`
-          : ''
+          : wantEnrichRetry
+            ? `<div class="modal-loading-inline muted">
+                <button type="button" class="btn ghost sm" id="modal-retry" data-char-id="${card.id}">Réessayer l’enrichissement</button>
+              </div>`
+            : ''
       }
       <div class="modal-hero">
         <div class="modal-art rarity-${card.rarity || 'commun'}">
@@ -818,18 +816,6 @@ function modalHtml() {
               : ''
           }
         </div>
-      </div>
-      <div class="modal-section">
-        <h3>À propos</h3>
-        <p class="modal-about">${
-          about
-            ? esc(about).replace(/\n/g, '<br>')
-            : limited
-              ? '<span class="muted">Biographie indisponible pour le moment.</span>'
-              : loading
-                ? '<span class="muted">Chargement…</span>'
-                : '<span class="muted">Pas de biographie disponible.</span>'
-        }</p>
       </div>
       ${
         showGallery
