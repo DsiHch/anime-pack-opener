@@ -1,213 +1,79 @@
 /**
- * GIFs aléatoires nekos.best (API v2) pour les cartes Légendaire.
- * Cache mémoire + localStorage par character id ; file d'attente pour limiter le débit.
+ * Affichage des portraits / GIFs légendaires.
+ *
+ * - Portrait Jikan (image / imageStill) = toujours la source de vérité du personnage.
+ * - imageGif = URL Giphy cuite dans catalog.json au build (jamais de clé API côté client).
+ * - Les anciens GIFs nekos.best sont purgés (ils ne correspondent pas au personnage).
  */
 
-const BASE = 'https://nekos.best/api/v2';
-const LS_KEY = 'apo-legendary-gifs';
-const MIN_INTERVAL_MS = 280;
+/** @deprecated */
+export const GIF_CATEGORIES = [];
 
-/** Catégories GIF uniquement (pas neko/waifu/kitsune/husbando). */
-export const GIF_CATEGORIES = [
-  'hug',
-  'dance',
-  'happy',
-  'smile',
-  'wink',
-  'spin',
-  'wave',
-  'pat',
-  'baka',
-  'bite',
-  'blush',
-  'bored',
-  'cry',
-  'cuddle',
-  'facepalm',
-  'feed',
-  'highfive',
-  'kiss',
-  'laugh',
-  'pout',
-  'shrug',
-  'slap',
-  'sleep',
-  'smug',
-  'stare',
-  'think',
-  'thumbsup',
-  'tickle',
-  'kick',
-  'handhold',
-  'punch',
-  'shoot',
-  'yeet',
-  'poke',
-  'nod',
-  'nom',
-  'nope',
-  'handshake',
-  'lurk',
-  'nibble',
-  'peck',
-  'yawn',
-  'angry',
-  'run',
-  'bonk',
-  'tableflip',
-  'bleh',
-  'blowkiss',
-  'carry',
-  'clap',
-  'confused',
-  'kabedon',
-  'lappillow',
-  'nya',
-  'salute',
-  'shake',
-  'shocked',
-  'sip',
-  'teehee',
-  'wag',
-];
-
-const memory = new Map();
-const inflight = new Map();
-let queue = Promise.resolve();
-let lastRequestAt = 0;
-
-function loadPersisted() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-    for (const [k, v] of Object.entries(raw)) {
-      if (typeof v === 'string' && v) memory.set(Number(k), v);
-    }
-  } catch {
-    /* ignore */
-  }
+export function getCachedGif(_characterId) {
+  return null;
 }
 
-function persist() {
-  try {
-    const obj = {};
-    for (const [k, v] of memory) obj[k] = v;
-    localStorage.setItem(LS_KEY, JSON.stringify(obj));
-  } catch {
-    /* quota / private mode */
-  }
+function isNekosUrl(url) {
+  return typeof url === 'string' && url.includes('nekos.best');
 }
 
-loadPersisted();
-
-function pickCategory() {
-  return GIF_CATEGORIES[Math.floor(Math.random() * GIF_CATEGORIES.length)];
+function isGiphyUrl(url) {
+  return typeof url === 'string' && (url.includes('giphy.com') || url.includes('gph.is'));
 }
 
-function enqueue(fn) {
-  const run = queue.then(async () => {
-    const wait = Math.max(0, MIN_INTERVAL_MS - (Date.now() - lastRequestAt));
-    if (wait) await new Promise((r) => setTimeout(r, wait));
-    lastRequestAt = Date.now();
-    return fn();
-  });
-  queue = run.catch(() => {});
-  return run;
-}
-
-export function getCachedGif(characterId) {
-  const id = Number(characterId);
-  return memory.get(id) || null;
-}
-
-/**
- * Conserve le portrait Jikan en imageStill ; applique le GIF en image / imageGif.
- */
+/** Conserve le still Jikan ; purge uniquement les URLs nekos.best. */
 export function ensureImageStill(card) {
   if (!card) return card;
   const current = card.image || '';
-  const isNekos = current.includes('nekos.best');
-  if (!card.imageStill) {
-    if (current && !isNekos) card.imageStill = current;
-    else if (card.imageGif && current === card.imageGif) {
-      /* already swapped without still — leave empty, caller keeps fallback */
+
+  if (isNekosUrl(current)) {
+    if (card.imageStill && !isNekosUrl(card.imageStill)) {
+      card.image = card.imageStill;
+    } else {
+      card.image = '';
     }
+  } else if (current && !card.imageStill && !isGiphyUrl(current)) {
+    card.imageStill = current;
+  }
+
+  // Purge legacy nekos GIFs only — keep Giphy baked into catalog
+  if (isNekosUrl(card.imageGif)) {
+    delete card.imageGif;
   }
   return card;
 }
 
+/** Applique un GIF Giphy (catalog) tout en gardant le still Jikan. */
 export function applyGifToCard(card, url) {
-  if (!card || !url) return card;
+  if (!card || !url || isNekosUrl(url)) return ensureImageStill(card);
   ensureImageStill(card);
   card.imageGif = url;
-  card.image = url;
   return card;
-}
-
-/** URL à afficher : GIF légendaire si dispo, sinon portrait Jikan. */
-export function cardDisplayImage(card) {
-  if (!card) return '';
-  if (card.rarity === 'legendaire') {
-    return (
-      card.imageGif ||
-      getCachedGif(card.id) ||
-      card.imageStill ||
-      (card.image && !String(card.image).includes('nekos.best') ? card.image : '') ||
-      card.image ||
-      ''
-    );
-  }
-  return card.image || card.imageStill || '';
 }
 
 /**
- * Récupère (ou renvoie le cache) un GIF aléatoire pour un personnage légendaire.
- * @param {number|string} characterId
- * @param {{ refresh?: boolean }} [opts] refresh=true force un nouveau tirage (ex. ouverture de booster)
+ * Affichage : GIF Giphy pour légendaire si présent, sinon portrait Jikan.
+ * Jamais de GIF nekos.best.
  */
-export async function fetchLegendaryGif(characterId, { refresh = false } = {}) {
-  const id = Number(characterId);
-  if (!Number.isFinite(id)) return null;
+export function cardDisplayImage(card) {
+  if (!card) return '';
+  ensureImageStill(card);
 
-  if (!refresh) {
-    const cached = getCachedGif(id);
-    if (cached) return cached;
-    if (inflight.has(id)) return inflight.get(id);
+  if (card.rarity === 'legendaire') {
+    const gif = card.imageGif;
+    if (gif && isGiphyUrl(gif) && !isNekosUrl(gif)) return gif;
   }
 
-  const promise = enqueue(async () => {
-    if (!refresh) {
-      const again = getCachedGif(id);
-      if (again) return again;
-    }
+  const still = card.imageStill || '';
+  const img = card.image || '';
+  if (still && !isNekosUrl(still) && !isGiphyUrl(still)) return still;
+  if (img && !isNekosUrl(img) && !isGiphyUrl(img)) return img;
+  if (still && !isNekosUrl(still)) return still;
+  if (img && !isNekosUrl(img)) return img;
+  return still || img || '';
+}
 
-    let lastErr;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const category = pickCategory();
-      try {
-        const res = await fetch(`${BASE}/${category}?amount=1`);
-        if (!res.ok) {
-          lastErr = new Error(`nekos ${res.status}`);
-          continue;
-        }
-        const data = await res.json();
-        const url = data?.results?.[0]?.url;
-        if (url) {
-          memory.set(id, url);
-          persist();
-          return url;
-        }
-      } catch (e) {
-        lastErr = e;
-      }
-    }
-    if (lastErr) console.warn('nekos.best GIF fetch failed', id, lastErr);
-    return getCachedGif(id) || null;
-  });
-
-  inflight.set(id, promise);
-  try {
-    return await promise;
-  } finally {
-    if (inflight.get(id) === promise) inflight.delete(id);
-  }
+/** Pas de fetch runtime — les GIFs sont dans catalog.json. */
+export async function fetchLegendaryGif(_characterIdOrCard, _opts = {}) {
+  return null;
 }

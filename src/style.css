@@ -566,16 +566,16 @@ body {
   filter: drop-shadow(0 0 22px rgba(168, 85, 247, 0.75));
 }
 .glow-legendaire {
-  filter: drop-shadow(0 0 28px rgba(245, 158, 11, 0.9));
-  animation: legendaryPulse 1.2s ease-in-out infinite alternate;
+  filter: drop-shadow(0 0 32px rgba(245, 158, 11, 0.95)) drop-shadow(0 0 12px rgba(251, 191, 36, 0.8));
+  animation: legendaryPulse 1.15s ease-in-out infinite alternate;
 }
 
 @keyframes legendaryPulse {
   from {
-    filter: drop-shadow(0 0 18px rgba(245, 158, 11, 0.6));
+    filter: drop-shadow(0 0 22px rgba(245, 158, 11, 0.7)) drop-shadow(0 0 8px rgba(251, 191, 36, 0.5));
   }
   to {
-    filter: drop-shadow(0 0 36px rgba(251, 191, 36, 1));
+    filter: drop-shadow(0 0 44px rgba(251, 191, 36, 1)) drop-shadow(0 0 18px rgba(245, 158, 11, 0.9));
   }
 }
 

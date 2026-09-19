@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:catalog": "node scripts/build-catalog.mjs",
+    "ship:catalog": "node scripts/ship-partial-catalog.mjs"
   },
   "devDependencies": {
     "vite": "^8.3.0"

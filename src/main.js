@@ -1,13 +1,7 @@
 import './style.css';
-import { fetchGlobalCharacterPool, GLOBAL_ANIME_IDS, getCharacterFull } from './jikan.js';
+import { GLOBAL_ANIME_IDS, getCharacterFull } from './jikan.js';
 import { enrichPool, openPack, RARITIES, PACK_SIZE } from './rarity.js';
-import {
-  applyGifToCard,
-  cardDisplayImage,
-  ensureImageStill,
-  fetchLegendaryGif,
-  getCachedGif,
-} from './nekos.js';
+import { cardDisplayImage, ensureImageStill } from './nekos.js';
 
 const ACCRUAL_MS = 5 * 60 * 1000;
 const MAX_PACKS = 10;
@@ -46,15 +40,14 @@ function loadCollection() {
     if (!Array.isArray(list)) return [];
     for (const c of list) {
       if (!c || c.rarity !== 'legendaire') continue;
-      const img = c.image || '';
-      if (img.includes('nekos.best')) {
-        c.imageGif = c.imageGif || img;
-        if (!c.imageStill) c.image = ''; // will restore from still or stay empty until GIF cache
+      // Purge anciens GIFs nekos ; conserver les GIFs Giphy du catalogue
+      if (c.image && String(c.image).includes('nekos.best')) {
+        c.image = c.imageStill && !String(c.imageStill).includes('nekos.best') ? c.imageStill : '';
       }
-      // Prefer persisted still as portrait fallback
-      if (c.imageStill && (!c.image || String(c.image).includes('nekos.best'))) {
-        // display prefers gif; keep still separate
+      if (c.imageGif && String(c.imageGif).includes('nekos.best')) {
+        delete c.imageGif;
       }
+      ensureImageStill(c);
     }
     return list;
   } catch {
@@ -193,8 +186,8 @@ function addToCollection(cards) {
       if (card.rarity === 'legendaire') {
         ensureImageStill(prev);
         if (card.imageStill) prev.imageStill = card.imageStill;
-        if (card.imageGif) applyGifToCard(prev, card.imageGif);
-        else hydrateLegendaryFromCache(prev);
+        if (card.imageGif) prev.imageGif = card.imageGif;
+        hydrateLegendaryFromCache(prev);
       }
     } else {
       const stored = {
@@ -237,128 +230,59 @@ function ownedUniqueByRarity() {
 }
 
 
-function syncCardGifEverywhere(id, url) {
-  const nid = Number(id);
-  const touch = (c) => {
-    if (c && c.id === nid && c.rarity === 'legendaire') applyGifToCard(c, url);
-  };
-  state.characterPool.forEach(touch);
-  state.collection.forEach(touch);
-  state.currentPack.forEach(touch);
-  if (state.modal?.card?.id === nid) touch(state.modal.card);
-  if (state.modal?.detail && state.modal.card?.id === nid && state.modal.card?.rarity === 'legendaire') {
-    state.modal.detail.image = url;
-  }
-}
-
-function updateLegendaryImagesInDom(id, url) {
-  if (!url) return;
-  document.querySelectorAll(`[data-char-id="${id}"] img`).forEach((img) => {
-    if (img.getAttribute('src') !== url) img.setAttribute('src', url);
-  });
-  // Modal hero may not have data-char-id on the img parent in all cases
-  const modalArt = document.querySelector('.modal-art img');
-  if (modalArt && state.modal?.card?.id === Number(id) && state.modal.card?.rarity === 'legendaire') {
-    if (modalArt.getAttribute('src') !== url) modalArt.setAttribute('src', url);
-  }
-}
-
-/**
- * Enrichit les légendaires avec un GIF nekos.best (file d'attente dans nekos.js).
- * refresh=true au nouvel open de booster pour cette carte.
- */
-async function enrichLegendaryCards(cards, { refresh = false } = {}) {
-  const list = (cards || []).filter((c) => c && c.rarity === 'legendaire' && c.id);
-  for (const card of list) {
-    ensureImageStill(card);
-    if (!refresh) {
-      const existing = card.imageGif || getCachedGif(card.id);
-      if (existing) {
-        applyGifToCard(card, existing);
-        syncCardGifEverywhere(card.id, existing);
-        updateLegendaryImagesInDom(card.id, existing);
-        continue;
-      }
-    }
-    try {
-      const url = await fetchLegendaryGif(card.id, { refresh });
-      if (url) {
-        applyGifToCard(card, url);
-        syncCardGifEverywhere(card.id, url);
-        updateLegendaryImagesInDom(card.id, url);
-      }
-    } catch {
-      /* keep Jikan still */
-    }
-  }
-}
-
+/** Portrait Jikan + GIF Giphy du catalogue (si présent). Purge nekos.best. */
 function hydrateLegendaryFromCache(card) {
   if (!card || card.rarity !== 'legendaire') return;
   ensureImageStill(card);
-  // If image was persisted as a nekos GIF without imageStill, don't treat it as still
-  if (card.image && String(card.image).includes('nekos.best')) {
-    card.imageGif = card.imageGif || card.image;
+  // Prefer catalog GIF if this card exists in the pool
+  const fromPool = state.characterPool.find((c) => c.id === card.id);
+  if (fromPool?.imageGif && String(fromPool.imageGif).includes('giphy.com')) {
+    card.imageGif = fromPool.imageGif;
   }
-  const g = card.imageGif || getCachedGif(card.id);
-  if (g) applyGifToCard(card, g);
-  else if (card.imageStill) card.image = card.imageStill;
+  if (card.imageStill && !String(card.imageStill).includes('nekos.best')) {
+    // keep still as Jikan fallback; display prefers imageGif via cardDisplayImage
+  }
 }
 
-let legendaryEnrichTimer = null;
-function scheduleLegendaryEnrich(cards, opts = {}) {
-  const snapshot = [...(cards || [])];
-  clearTimeout(legendaryEnrichTimer);
-  legendaryEnrichTimer = setTimeout(() => {
-    enrichLegendaryCards(snapshot, opts);
-  }, 40);
+/** No-op — GIFs sont déjà dans catalog.json (pas de fetch runtime). */
+function scheduleLegendaryEnrich(_cards, _opts = {}) {
+  /* intentionally empty */
 }
-
 
 async function init() {
   loadPackBank();
   state.view = 'loading';
-  state.loadProgress = { done: 0, total: GLOBAL_ANIME_IDS.length, title: '' };
+  state.loadProgress = null;
   render();
   startAccrualTicker();
 
   try {
-    const raw = await fetchGlobalCharacterPool(GLOBAL_ANIME_IDS, {
-      onProgress: (done, total, title) => {
-        state.loadProgress = { done, total, title };
-        // Light update: only refresh loading panel text if still loading
-        const label = document.getElementById('load-progress');
-        if (label && state.view === 'loading') {
-          label.textContent =
-            done >= total
-              ? `Finalisation… (${total} animes)`
-              : `Chargement ${done + 1}/${total}…${title ? ` ${title}` : ''}`;
-        }
-      },
-    });
-    if (raw.length < PACK_SIZE) {
-      state.error = `Pool trop petit (${raw.length} personnages). Réessaie plus tard.`;
+    const catalogUrl = `${import.meta.env.BASE_URL}catalog.json`;
+    const res = await fetch(catalogUrl);
+    if (!res.ok) throw new Error(`catalog ${res.status}`);
+    const raw = await res.json();
+    if (!Array.isArray(raw) || raw.length < PACK_SIZE) {
+      state.error = `Catalogue trop petit (${Array.isArray(raw) ? raw.length : 0} personnages).`;
       state.poolReady = false;
-      state.loadProgress = null;
       state.view = 'home';
       render();
       return;
     }
+    // Catalogue déjà enrichi (favorites-only) ; re-enrich pour cohérence si seuils changent
     state.characterPool = enrichPool(raw);
     for (const c of state.characterPool) hydrateLegendaryFromCache(c);
     for (const c of state.collection) hydrateLegendaryFromCache(c);
     state.poolReady = true;
     state.error = null;
-    state.loadProgress = null;
     state.view = 'home';
   } catch (e) {
-    state.error = 'Impossible de charger le pool global. Réessaie.';
+    state.error = 'Impossible de charger le catalogue local. Réessaie.';
     state.poolReady = false;
-    state.loadProgress = null;
     state.view = 'home';
   }
   render();
 }
+
 
 function startPackOpen() {
   if (!state.poolReady || !canOpenPack()) return;
@@ -386,8 +310,6 @@ function startPackOpen() {
   state.tab = 'open';
   state.error = null;
   render();
-  // Nouveau GIF à chaque ouverture de booster pour les légendaires du pack
-  scheduleLegendaryEnrich(state.currentPack, { refresh: true });
 }
 
 /**
@@ -459,9 +381,7 @@ function detailFromLocalCard(card) {
     nicknames: [],
     about: '',
     favorites: card.favorites ?? 0,
-    image: card.rarity === 'legendaire'
-      ? cardDisplayImage(card) || card.imageStill || card.image || ''
-      : card.image || '',
+    image: cardDisplayImage(card) || card.image || '',
     url: card.id ? `https://myanimelist.net/character/${card.id}` : '',
     anime: card.animeTitle
       ? [{ role: card.role || '', title: card.animeTitle, malId: card.animeId, url: '' }]
@@ -509,9 +429,6 @@ async function openCharacterModal(cardOrId) {
     };
   }
   render();
-  if (card.rarity === 'legendaire') {
-    scheduleLegendaryEnrich([card], { refresh: false });
-  }
 }
 
 function closeModal() {
@@ -553,21 +470,11 @@ function render() {
       }
     </main>
     <footer class="footer">
-      Données via <a href="https://jikan.moe" target="_blank" rel="noopener">Jikan API</a> · GIFs légendaires <a href="https://nekos.best" target="_blank" rel="noopener">nekos.best</a>
+      Pool via catalogue local · détail <a href="https://jikan.moe" target="_blank" rel="noopener">Jikan</a> · GIFs légendaires <a href="https://giphy.com" target="_blank" rel="noopener">Giphy</a>
     </footer>
     ${state.modal ? modalHtml() : ''}
   `;
   bindEvents();
-  // Lazy GIF pour légendaires visibles (collection / catalogue / reveal / modal)
-  const toEnrich = [];
-  if (state.tab === 'collection') toEnrich.push(...state.collection);
-  else if (state.tab === 'catalogue') {
-    toEnrich.push(...state.characterPool.filter((c) => c.rarity === 'legendaire'));
-  } else if (state.view === 'reveal') toEnrich.push(...state.currentPack);
-  if (state.modal?.card) toEnrich.push(state.modal.card);
-  if (toEnrich.some((c) => c?.rarity === 'legendaire')) {
-    scheduleLegendaryEnrich(toEnrich, { refresh: false });
-  }
 }
 
 function openTabHtml() {
@@ -631,18 +538,12 @@ function homeHtml() {
 }
 
 function loadingHtml() {
-  const p = state.loadProgress;
-  const progressText = p
-    ? p.done >= p.total
-      ? `Finalisation… (${p.total} animes)`
-      : `Chargement ${p.done + 1}/${p.total}…${p.title ? ` ${esc(p.title)}` : ''}`
-    : `Personnages de ${GLOBAL_ANIME_IDS.length} animes populaires`;
   return `
     <section class="panel center-panel">
       <div class="spinner"></div>
-      <h2>Chargement du pool global…</h2>
-      <p class="lead" id="load-progress">${progressText}</p>
-      <p class="muted">Jikan API · merci de patienter (${GLOBAL_ANIME_IDS.length} séries)</p>
+      <h2>Chargement du catalogue…</h2>
+      <p class="lead" id="load-progress">Préparation du pool global</p>
+      <p class="muted">Catalogue local · démarrage instantané</p>
     </section>
   `;
 }
@@ -897,9 +798,7 @@ function modalHtml() {
       <div class="modal-hero">
         <div class="modal-art rarity-${card.rarity || 'commun'}">
           <img src="${escAttr(
-            card.rarity === 'legendaire'
-              ? cardDisplayImage(card) || d.image || card.imageStill || card.image
-              : d.image || card.image
+            cardDisplayImage(card) || d.image || card.image || ''
           )}" alt="${escAttr(d.name || card.name)}" />
         </div>
         <div class="modal-meta">
