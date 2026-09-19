@@ -1,6 +1,13 @@
 import './style.css';
 import { fetchGlobalCharacterPool, GLOBAL_ANIME_IDS, getCharacterFull } from './jikan.js';
 import { enrichPool, openPack, RARITIES, PACK_SIZE } from './rarity.js';
+import {
+  applyGifToCard,
+  cardDisplayImage,
+  ensureImageStill,
+  fetchLegendaryGif,
+  getCachedGif,
+} from './nekos.js';
 
 const ACCRUAL_MS = 5 * 60 * 1000;
 const MAX_PACKS = 10;
@@ -35,7 +42,21 @@ const app = document.querySelector('#app');
 
 function loadCollection() {
   try {
-    return JSON.parse(localStorage.getItem(LS_COLLECTION) || '[]');
+    const list = JSON.parse(localStorage.getItem(LS_COLLECTION) || '[]');
+    if (!Array.isArray(list)) return [];
+    for (const c of list) {
+      if (!c || c.rarity !== 'legendaire') continue;
+      const img = c.image || '';
+      if (img.includes('nekos.best')) {
+        c.imageGif = c.imageGif || img;
+        if (!c.imageStill) c.image = ''; // will restore from still or stay empty until GIF cache
+      }
+      // Prefer persisted still as portrait fallback
+      if (c.imageStill && (!c.image || String(c.image).includes('nekos.best'))) {
+        // display prefers gif; keep still separate
+      }
+    }
+    return list;
   } catch {
     return [];
   }
@@ -169,12 +190,23 @@ function addToCollection(cards) {
     const prev = map.get(card.id);
     if (prev) {
       prev.count = (prev.count || 1) + 1;
+      if (card.rarity === 'legendaire') {
+        ensureImageStill(prev);
+        if (card.imageStill) prev.imageStill = card.imageStill;
+        if (card.imageGif) applyGifToCard(prev, card.imageGif);
+        else hydrateLegendaryFromCache(prev);
+      }
     } else {
-      map.set(card.id, {
+      const stored = {
         ...card,
         count: 1,
         animeTitle: card.animeTitle || '',
-      });
+      };
+      if (stored.rarity === 'legendaire') {
+        ensureImageStill(stored);
+        hydrateLegendaryFromCache(stored);
+      }
+      map.set(card.id, stored);
     }
   }
   state.collection = [...map.values()].sort((a, b) => {
@@ -203,6 +235,85 @@ function ownedUniqueByRarity() {
   }
   return owned;
 }
+
+
+function syncCardGifEverywhere(id, url) {
+  const nid = Number(id);
+  const touch = (c) => {
+    if (c && c.id === nid && c.rarity === 'legendaire') applyGifToCard(c, url);
+  };
+  state.characterPool.forEach(touch);
+  state.collection.forEach(touch);
+  state.currentPack.forEach(touch);
+  if (state.modal?.card?.id === nid) touch(state.modal.card);
+  if (state.modal?.detail && state.modal.card?.id === nid && state.modal.card?.rarity === 'legendaire') {
+    state.modal.detail.image = url;
+  }
+}
+
+function updateLegendaryImagesInDom(id, url) {
+  if (!url) return;
+  document.querySelectorAll(`[data-char-id="${id}"] img`).forEach((img) => {
+    if (img.getAttribute('src') !== url) img.setAttribute('src', url);
+  });
+  // Modal hero may not have data-char-id on the img parent in all cases
+  const modalArt = document.querySelector('.modal-art img');
+  if (modalArt && state.modal?.card?.id === Number(id) && state.modal.card?.rarity === 'legendaire') {
+    if (modalArt.getAttribute('src') !== url) modalArt.setAttribute('src', url);
+  }
+}
+
+/**
+ * Enrichit les légendaires avec un GIF nekos.best (file d'attente dans nekos.js).
+ * refresh=true au nouvel open de booster pour cette carte.
+ */
+async function enrichLegendaryCards(cards, { refresh = false } = {}) {
+  const list = (cards || []).filter((c) => c && c.rarity === 'legendaire' && c.id);
+  for (const card of list) {
+    ensureImageStill(card);
+    if (!refresh) {
+      const existing = card.imageGif || getCachedGif(card.id);
+      if (existing) {
+        applyGifToCard(card, existing);
+        syncCardGifEverywhere(card.id, existing);
+        updateLegendaryImagesInDom(card.id, existing);
+        continue;
+      }
+    }
+    try {
+      const url = await fetchLegendaryGif(card.id, { refresh });
+      if (url) {
+        applyGifToCard(card, url);
+        syncCardGifEverywhere(card.id, url);
+        updateLegendaryImagesInDom(card.id, url);
+      }
+    } catch {
+      /* keep Jikan still */
+    }
+  }
+}
+
+function hydrateLegendaryFromCache(card) {
+  if (!card || card.rarity !== 'legendaire') return;
+  ensureImageStill(card);
+  // If image was persisted as a nekos GIF without imageStill, don't treat it as still
+  if (card.image && String(card.image).includes('nekos.best')) {
+    card.imageGif = card.imageGif || card.image;
+  }
+  const g = card.imageGif || getCachedGif(card.id);
+  if (g) applyGifToCard(card, g);
+  else if (card.imageStill) card.image = card.imageStill;
+}
+
+let legendaryEnrichTimer = null;
+function scheduleLegendaryEnrich(cards, opts = {}) {
+  const snapshot = [...(cards || [])];
+  clearTimeout(legendaryEnrichTimer);
+  legendaryEnrichTimer = setTimeout(() => {
+    enrichLegendaryCards(snapshot, opts);
+  }, 40);
+}
+
 
 async function init() {
   loadPackBank();
@@ -234,6 +345,8 @@ async function init() {
       return;
     }
     state.characterPool = enrichPool(raw);
+    for (const c of state.characterPool) hydrateLegendaryFromCache(c);
+    for (const c of state.collection) hydrateLegendaryFromCache(c);
     state.poolReady = true;
     state.error = null;
     state.loadProgress = null;
@@ -263,6 +376,9 @@ function startPackOpen() {
   startAccrualTicker();
 
   state.currentPack = openPack(state.characterPool, PACK_SIZE);
+  for (const c of state.currentPack) {
+    if (c.rarity === 'legendaire') ensureImageStill(c);
+  }
   state.revealIndex = -1;
   state.revealing = false;
   state.justRevealed = false;
@@ -270,6 +386,8 @@ function startPackOpen() {
   state.tab = 'open';
   state.error = null;
   render();
+  // Nouveau GIF à chaque ouverture de booster pour les légendaires du pack
+  scheduleLegendaryEnrich(state.currentPack, { refresh: true });
 }
 
 /**
@@ -341,7 +459,9 @@ function detailFromLocalCard(card) {
     nicknames: [],
     about: '',
     favorites: card.favorites ?? 0,
-    image: card.image || '',
+    image: card.rarity === 'legendaire'
+      ? cardDisplayImage(card) || card.imageStill || card.image || ''
+      : card.image || '',
     url: card.id ? `https://myanimelist.net/character/${card.id}` : '',
     anime: card.animeTitle
       ? [{ role: card.role || '', title: card.animeTitle, malId: card.animeId, url: '' }]
@@ -389,6 +509,9 @@ async function openCharacterModal(cardOrId) {
     };
   }
   render();
+  if (card.rarity === 'legendaire') {
+    scheduleLegendaryEnrich([card], { refresh: false });
+  }
 }
 
 function closeModal() {
@@ -430,11 +553,21 @@ function render() {
       }
     </main>
     <footer class="footer">
-      Données via <a href="https://jikan.moe" target="_blank" rel="noopener">Jikan API</a> · images MyAnimeList
+      Données via <a href="https://jikan.moe" target="_blank" rel="noopener">Jikan API</a> · GIFs légendaires <a href="https://nekos.best" target="_blank" rel="noopener">nekos.best</a>
     </footer>
     ${state.modal ? modalHtml() : ''}
   `;
   bindEvents();
+  // Lazy GIF pour légendaires visibles (collection / catalogue / reveal / modal)
+  const toEnrich = [];
+  if (state.tab === 'collection') toEnrich.push(...state.collection);
+  else if (state.tab === 'catalogue') {
+    toEnrich.push(...state.characterPool.filter((c) => c.rarity === 'legendaire'));
+  } else if (state.view === 'reveal') toEnrich.push(...state.currentPack);
+  if (state.modal?.card) toEnrich.push(state.modal.card);
+  if (toEnrich.some((c) => c?.rarity === 'legendaire')) {
+    scheduleLegendaryEnrich(toEnrich, { refresh: false });
+  }
 }
 
 function openTabHtml() {
@@ -551,7 +684,7 @@ function revealHtml() {
           .map((c, i) => {
             if (i > idx) return `<div class="trail-slot locked">?</div>`;
             return `<button type="button" class="trail-slot rarity-${c.rarity} clickable" data-char-id="${c.id}" title="${escAttr(c.name)}">
-              <img src="${escAttr(c.image)}" alt="" />
+              <img src="${escAttr(cardDisplayImage(c))}" alt="" />
             </button>`;
           })
           .join('')}
@@ -585,7 +718,7 @@ function cardFaceHtml(card, animate) {
         <div class="tcg-frame">
           <span class="rarity-badge" style="--rc:${card.rarityColor}">${esc(card.rarityLabel)}</span>
           <div class="tcg-art">
-            <img src="${escAttr(card.image)}" alt="${escAttr(card.name)}" />
+            <img src="${escAttr(cardDisplayImage(card))}" alt="${escAttr(card.name)}" />
           </div>
           <div class="tcg-footer">
             <h3>${esc(card.name)}</h3>
@@ -715,7 +848,7 @@ function miniCardHtml(card, showCount = false, isOwned = false) {
   return `
     <article class="mini-card clickable-card rarity-${card.rarity} ${ownedClass}" data-char-id="${card.id}" role="button" tabindex="0" aria-label="Voir ${escAttr(card.name)}">
       <div class="mini-art">
-        <img src="${escAttr(card.image)}" alt="${escAttr(card.name)}" loading="lazy" />
+        <img src="${escAttr(cardDisplayImage(card))}" alt="${escAttr(card.name)}" loading="lazy" />
         <span class="mini-badge" style="--rc:${card.rarityColor}">${esc(card.rarityLabel)}</span>
         ${showCount && card.count > 1 ? `<span class="count">×${card.count}</span>` : ''}
         ${isOwned ? '<span class="owned-badge">✓</span>' : ''}
@@ -763,7 +896,11 @@ function modalHtml() {
       }
       <div class="modal-hero">
         <div class="modal-art rarity-${card.rarity || 'commun'}">
-          <img src="${escAttr(d.image || card.image)}" alt="${escAttr(d.name || card.name)}" />
+          <img src="${escAttr(
+            card.rarity === 'legendaire'
+              ? cardDisplayImage(card) || d.image || card.imageStill || card.image
+              : d.image || card.image
+          )}" alt="${escAttr(d.name || card.name)}" />
         </div>
         <div class="modal-meta">
           <h2 id="modal-title">${esc(d.name || card.name)}</h2>
