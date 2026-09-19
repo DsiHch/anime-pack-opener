@@ -24,7 +24,8 @@ const state = {
   lastAccrualAt: 0,
   nextPackLeftMs: 0,
   catalogueFilter: 'all', // all | rarity id
-  modal: null, // { status: 'loading'|'ready'|'error', card, detail, error }
+  loadProgress: null, // { done, total, title } during pool fetch
+  modal: null, // { status: 'loading'|'ready'|'limited'|'error', card, detail, error, limited }
 };
 
 let accrualTimer = null;
@@ -206,14 +207,28 @@ function ownedUniqueByRarity() {
 async function init() {
   loadPackBank();
   state.view = 'loading';
+  state.loadProgress = { done: 0, total: GLOBAL_ANIME_IDS.length, title: '' };
   render();
   startAccrualTicker();
 
   try {
-    const raw = await fetchGlobalCharacterPool(GLOBAL_ANIME_IDS);
+    const raw = await fetchGlobalCharacterPool(GLOBAL_ANIME_IDS, {
+      onProgress: (done, total, title) => {
+        state.loadProgress = { done, total, title };
+        // Light update: only refresh loading panel text if still loading
+        const label = document.getElementById('load-progress');
+        if (label && state.view === 'loading') {
+          label.textContent =
+            done >= total
+              ? `Finalisation… (${total} animes)`
+              : `Chargement ${done + 1}/${total}…${title ? ` ${title}` : ''}`;
+        }
+      },
+    });
     if (raw.length < PACK_SIZE) {
       state.error = `Pool trop petit (${raw.length} personnages). Réessaie plus tard.`;
       state.poolReady = false;
+      state.loadProgress = null;
       state.view = 'home';
       render();
       return;
@@ -221,10 +236,12 @@ async function init() {
     state.characterPool = enrichPool(raw);
     state.poolReady = true;
     state.error = null;
+    state.loadProgress = null;
     state.view = 'home';
   } catch (e) {
     state.error = 'Impossible de charger le pool global. Réessaie.';
     state.poolReady = false;
+    state.loadProgress = null;
     state.view = 'home';
   }
   render();
@@ -316,24 +333,59 @@ function findCardById(id) {
   );
 }
 
+function detailFromLocalCard(card) {
+  return {
+    id: card.id,
+    name: card.name,
+    nameKanji: '',
+    nicknames: [],
+    about: '',
+    favorites: card.favorites ?? 0,
+    image: card.image || '',
+    url: card.id ? `https://myanimelist.net/character/${card.id}` : '',
+    anime: card.animeTitle
+      ? [{ role: card.role || '', title: card.animeTitle, malId: card.animeId, url: '' }]
+      : [],
+    pictures: [],
+    partial: true,
+    fromLocal: true,
+  };
+}
+
 async function openCharacterModal(cardOrId) {
   const card = typeof cardOrId === 'object' ? cardOrId : findCardById(cardOrId);
   if (!card?.id) return;
 
-  state.modal = { status: 'loading', card, detail: null, error: null };
+  // Show local card immediately while API loads
+  const localDetail = detailFromLocalCard(card);
+  state.modal = {
+    status: 'loading',
+    card,
+    detail: localDetail,
+    error: null,
+    limited: false,
+  };
   render();
 
   try {
     const detail = await getCharacterFull(card.id);
     if (!state.modal || state.modal.card?.id !== card.id) return;
-    state.modal = { status: 'ready', card, detail, error: null };
+    state.modal = {
+      status: 'ready',
+      card,
+      detail,
+      error: null,
+      limited: !!detail.partial,
+    };
   } catch (e) {
     if (!state.modal || state.modal.card?.id !== card.id) return;
+    // Usable fallback from local card — never a dead-end empty error only
     state.modal = {
-      status: 'error',
+      status: 'limited',
       card,
-      detail: null,
-      error: 'Impossible de charger les infos du personnage.',
+      detail: localDetail,
+      error: null,
+      limited: true,
     };
   }
   render();
@@ -446,12 +498,18 @@ function homeHtml() {
 }
 
 function loadingHtml() {
+  const p = state.loadProgress;
+  const progressText = p
+    ? p.done >= p.total
+      ? `Finalisation… (${p.total} animes)`
+      : `Chargement ${p.done + 1}/${p.total}…${p.title ? ` ${esc(p.title)}` : ''}`
+    : `Personnages de ${GLOBAL_ANIME_IDS.length} animes populaires`;
   return `
     <section class="panel center-panel">
       <div class="spinner"></div>
       <h2>Chargement du pool global…</h2>
-      <p class="lead">Personnages de ${GLOBAL_ANIME_IDS.length} animes populaires</p>
-      <p class="muted">Jikan API · merci de patienter</p>
+      <p class="lead" id="load-progress">${progressText}</p>
+      <p class="muted">Jikan API · merci de patienter (${GLOBAL_ANIME_IDS.length} séries)</p>
     </section>
   `;
 }
@@ -673,15 +731,11 @@ function modalHtml() {
   if (!m) return '';
   const card = m.card || {};
   const d = m.detail;
+  const limited = m.limited || m.status === 'limited';
+  const loading = m.status === 'loading';
 
   let body = '';
-  if (m.status === 'loading') {
-    body = `
-      <div class="modal-loading">
-        <div class="spinner"></div>
-        <p>Chargement de ${esc(card.name)}…</p>
-      </div>`;
-  } else if (m.status === 'error') {
+  if (!d && m.status === 'error') {
     body = `
       <div class="modal-error">
         <p>${esc(m.error || 'Erreur')}</p>
@@ -691,7 +745,22 @@ function modalHtml() {
     const about = (d.about || '').trim();
     const nicknames = d.nicknames || [];
     const animeList = d.anime || [];
+    const pictures = (d.pictures || []).filter(Boolean);
+    const showGallery = pictures.length > 1;
     body = `
+      ${
+        limited
+          ? `<div class="modal-limited-banner" role="status">
+              Infos limitées (API temporairement indisponible)
+              <button type="button" class="btn ghost sm" id="modal-retry" data-char-id="${card.id}">Réessayer</button>
+            </div>`
+          : ''
+      }
+      ${
+        loading
+          ? `<div class="modal-loading-inline"><div class="spinner sm"></div><span>Enrichissement des infos…</span></div>`
+          : ''
+      }
       <div class="modal-hero">
         <div class="modal-art rarity-${card.rarity || 'commun'}">
           <img src="${escAttr(d.image || card.image)}" alt="${escAttr(d.name || card.name)}" />
@@ -700,6 +769,7 @@ function modalHtml() {
           <h2 id="modal-title">${esc(d.name || card.name)}</h2>
           ${d.nameKanji ? `<p class="modal-kanji">${esc(d.nameKanji)}</p>` : ''}
           ${card.rarityLabel ? `<span class="rarity-badge inline-badge" style="--rc:${card.rarityColor || '#94a3b8'}">${esc(card.rarityLabel)}</span>` : ''}
+          ${card.role ? `<p class="modal-role">${esc(roleFr(card.role))}${card.animeTitle ? ` · ${esc(card.animeTitle)}` : ''}</p>` : ''}
           <p class="modal-fav">★ ${Number(d.favorites || card.favorites || 0).toLocaleString('fr-FR')} favoris</p>
           ${
             nicknames.length
@@ -715,8 +785,32 @@ function modalHtml() {
       </div>
       <div class="modal-section">
         <h3>À propos</h3>
-        <p class="modal-about">${about ? esc(about).replace(/\n/g, '<br>') : '<span class="muted">Pas de biographie disponible.</span>'}</p>
+        <p class="modal-about">${
+          about
+            ? esc(about).replace(/\n/g, '<br>')
+            : limited
+              ? '<span class="muted">Biographie indisponible pour le moment.</span>'
+              : loading
+                ? '<span class="muted">Chargement…</span>'
+                : '<span class="muted">Pas de biographie disponible.</span>'
+        }</p>
       </div>
+      ${
+        showGallery
+          ? `<div class="modal-section">
+              <h3>Galerie (${pictures.length})</h3>
+              <div class="modal-gallery">
+                ${pictures
+                  .slice(0, 24)
+                  .map(
+                    (url) =>
+                      `<a class="gallery-thumb" href="${escAttr(url)}" target="_blank" rel="noopener"><img src="${escAttr(url)}" alt="" loading="lazy" /></a>`
+                  )
+                  .join('')}
+              </div>
+            </div>`
+          : ''
+      }
       <div class="modal-section">
         <h3>Apparitions anime (${animeList.length})</h3>
         ${
@@ -746,7 +840,6 @@ function modalHtml() {
     </div>
   `;
 }
-
 function roleFr(role) {
   const r = (role || '').toLowerCase();
   if (r === 'main') return 'Principal';
