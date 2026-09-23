@@ -3,7 +3,7 @@ import { GLOBAL_ANIME_IDS, getCharacterFull } from './jikan.js';
 import { enrichPool, openPack, RARITIES, PACK_SIZE } from './rarity.js';
 import { cardDisplayImage, ensureImageStill } from './nekos.js';
 
-const ACCRUAL_MS = 5 * 60 * 1000;
+const ACCRUAL_MS = 3 * 1000;
 const MAX_PACKS = 10;
 const LS_COLLECTION = 'apo-collection';
 const LS_PACK_COUNT = 'apo-packCount';
